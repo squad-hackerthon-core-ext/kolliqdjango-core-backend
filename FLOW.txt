@@ -1,0 +1,35 @@
+DAY 1 — Foundation & Auth (Ship: Database schema + OTP auth + wallets)
+Goal: Both engineers share a working foundation by end of day.
+You (Django) — Day 1
+
+ Scaffold Django project with modular app structure: users, jobs, payments, scoring, financial_services
+ Design and migrate the full PostgreSQL schema:
+
+User (phone, name, role: worker/trader/employer, location, skills, languages, vehicle)
+Wallet (user FK, balance, squad_account_number, squad_virtual_acct_ref)
+Job (title, skill_required, location_lat/lng, pay, duration, status, employer FK)
+JobApplication (job FK, worker FK, status, accepted_at)
+Transaction (user FK, amount, type: credit/debit/escrow, reference, timestamp)
+EconomicIdentityScore (user FK, score, last_calculated, breakdown JSON)
+Loan (user FK, amount, interest_rate, status, repayment_schedule JSON)
+InsurancePolicy (user FK, daily_premium, coverage_limit, status)
+Rating (from_user FK, to_user FK, job FK, stars, comment)
+
+
+ Integrate Squad API: create_virtual_account() endpoint wired to post-registration signal
+ Django Admin set up with all models registered and usable
+ Environment config: .env for Squad keys, Africa's Talking keys, DB URL, Redis URL
+ Basic health check endpoint: GET /api/health/
+
+Partner (Node.js) — Day 1
+
+ Scaffold Node project: Express + routes for auth, ussd, whatsapp, webhooks
+ OTP flow: POST /auth/request-otp → Africa's Talking SMS → store OTP in Redis (5 min TTL)
+ OTP verify: POST /auth/verify-otp → call Django POST /api/users/create/ on success
+ USSD handler skeleton: parse incoming Africa's Talking USSD POST, route by session state (Redis session store)
+ WhatsApp webhook skeleton: receive Twilio/WhatsApp POST, parse body, stub intent router
+ Redis session structure defined for USSD multi-step flows
+
+End of Day 1 Checkpoint ✅
+
+A new phone number can request OTP → receive SMS → verify → Django creates User + Squad wallet → account number returned. Both engineers can test this together.

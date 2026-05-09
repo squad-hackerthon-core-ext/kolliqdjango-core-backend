@@ -1,0 +1,253 @@
+import environ
+import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+env = environ.Env(DEBUG=(bool, False))
+environ.Env.read_env(BASE_DIR / '.env')
+
+SECRET_KEY = env('SECRET_KEY')
+DEBUG = env('DEBUG')
+ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=['localhost','.ngrok-free.dev'])
+
+DJANGO_APPS = [
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.staticfiles',
+]
+
+THIRD_PARTY_APPS = [
+    'rest_framework',
+    'rest_framework_simplejwt',
+    'drf_spectacular',
+    'corsheaders',
+    'django_celery_beat',
+]
+
+LOCAL_APPS = [
+    'apps.common',
+    'apps.users',
+    'apps.wallets',
+    'apps.jobs',
+    'apps.payments',
+    'apps.scoring',
+    'apps.financial_services',
+    'apps.partner',
+    'apps.marketplace',
+]
+
+INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
+
+MIDDLEWARE = [
+    'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+ROOT_URLCONF = 'kolliq.urls'
+
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.debug',
+                'django.template.context_processors.request',
+                'django.contrib.auth.context_processors.auth',
+                'django.contrib.messages.context_processors.messages',
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = 'kolliq.wsgi.application'
+
+# Database
+DATABASES = {
+    'default': env.db('DATABASE_URL', default='sqlite:///db.sqlite3')
+}
+
+# Cache / Redis
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': env('REDIS_URL', default='redis://localhost:6379/0'),
+    }
+}
+
+# Celery
+CELERY_BROKER_URL = env('REDIS_URL', default='redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = env('REDIS_URL', default='redis://localhost:6379/0')
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# Auth
+AUTH_USER_MODEL = 'users.User'
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
+    'DEFAULT_RENDERER_CLASSES': (
+        'rest_framework.renderers.JSONRenderer',
+    ),
+    'EXCEPTION_HANDLER': 'kolliq.utils.custom_exception_handler',
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Kolliq API',
+    'DESCRIPTION': 'Kolliq - Micro-work & Gig Economy Platform API',
+    'VERSION': '1.0.0',
+    'SERVE_PERMISSIONS': ['rest_framework.permissions.AllowAny'],
+    'RETRIEVE_TRAILING_SLASH': False,
+    'SCHEMA_PATH_PREFIX': r'/api/',
+    'CONTACT': {
+        'name': 'Kolliq Support',
+        'email': 'support@kolliq.com',
+    },
+    'LICENSE': {
+        'name': 'Proprietary',
+        'url': 'https://kolliq.com/license',
+    },
+    'AUTHENTICATION_FLOWS': {
+        'jwt': {
+            'type': 'http',
+            'scheme': 'bearer',
+            'bearerFormat': 'JWT',
+            'description': 'JWT token authentication. Obtain token via /api/users/token/ endpoint.',
+        },
+    },
+    'SECURITY': [
+        {'jwt': []},
+    ],
+    'SECURITY_SCHEMES': {
+        'jwt': {
+            'type': 'http',
+            'scheme': 'bearer',
+            'bearerFormat': 'JWT',
+            'description': 'JWT token authentication. Obtain token via /api/users/token/ endpoint.',
+        },
+    },
+    'SORT_OPERATION_PARAMETERS': True,
+    'SORT_SECURITY_SCHEMES': True,
+    'ENUM_ADD_EXPLICIT_BLANK_NULL_CHOICE': True,
+    'POSTPROCESSING_HOOKS': [],
+    'TAGS_SORTER': None,
+    'OPERATION_SORTER': None,
+}
+
+from datetime import timedelta
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=7),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
+}
+
+CORS_ALLOW_ALL_ORIGINS = DEBUG
+
+# Squad
+SQUAD_SECRET_KEY = env('SQUAD_SECRET_KEY', default='')
+SQUAD_PUBLIC_KEY = env('SQUAD_PUBLIC_KEY', default='')
+SQUAD_BASE_URL = env('SQUAD_BASE_URL', default='https://sandbox-api-d.squadco.com')
+SQUAD_WEBHOOK_SECRET = env('SQUAD_WEBHOOK_SECRET', default='')
+
+# Africa's Talking
+AT_USERNAME = env('AT_USERNAME', default='sandbox')
+AT_API_KEY = env('AT_API_KEY', default='')
+AT_SENDER_ID = env('AT_SENDER_ID', default='KOLLIQ')
+
+# Platform Config
+PLATFORM_FEE_PERCENT = env.int('PLATFORM_FEE_PERCENT', default=5)
+ARISE_WALLET_ID = env.int('ARISE_WALLET_ID', default=1)
+
+AUTH_PASSWORD_VALIDATORS = [
+    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
+]
+
+LANGUAGE_CODE = 'en-us'
+TIME_ZONE = 'Africa/Lagos'
+USE_I18N = True
+USE_TZ = True
+
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# ── System Virtual Accounts (created once at deploy, never change) ──────────
+KOLLIQ_ESCROW_VIRTUAL_ACCOUNT = env('KOLLIQ_ESCROW_VIRTUAL_ACCOUNT', default='')
+KOLLIQ_PLATFORM_VIRTUAL_ACCOUNT = env('KOLLIQ_PLATFORM_VIRTUAL_ACCOUNT', default='')
+SQUAD_ESCROW_CUSTOMER_ID = env('SQUAD_ESCROW_CUSTOMER_ID', default='kolliq-escrow')
+
+# ── Demo Float for simulated loans/insurance disbursements ──────────────────
+DEMO_FLOAT_WALLET_ID = env.int('DEMO_FLOAT_WALLET_ID', default=2)
+DEMO_FLOAT_INITIAL_BALANCE = env.int('DEMO_FLOAT_INITIAL_BALANCE', default=500000)
+
+# ── Financial Services Config ───────────────────────────────────────────────
+LOAN_SCORE_THRESHOLD = env.int('LOAN_SCORE_THRESHOLD', default=50)
+INSURANCE_SCORE_THRESHOLD = env.int('INSURANCE_SCORE_THRESHOLD', default=70)
+SAVINGS_SCORE_THRESHOLD = env.int('SAVINGS_SCORE_THRESHOLD', default=20)
+LOAN_INTEREST_RATE_MONTHLY = env.float('LOAN_INTEREST_RATE_MONTHLY', default=5.0)
+INSURANCE_DAILY_PREMIUM = env.int('INSURANCE_DAILY_PREMIUM', default=200)   # naira
+INSURANCE_COVERAGE_LIMIT = env.int('INSURANCE_COVERAGE_LIMIT', default=50000)
+SAVINGS_ANNUAL_INTEREST_RATE = env.float('SAVINGS_ANNUAL_INTEREST_RATE', default=5.0)
+
+# ── Partner API ─────────────────────────────────────────────────────────────
+PARTNER_API_SECRET = env('PARTNER_API_SECRET', default='change-me-in-production')
+FINANCIAL_PARTNER_MODE = env('FINANCIAL_PARTNER_MODE', default='simulated')
+# When a real microfinance partner connects: switch to 'live'
+# and swap disbursement logic in financial_services/views.py
+
+# ── Celery Beat Schedule ─────────────────────────────────────────────────────
+from celery.schedules import crontab
+
+CELERY_BEAT_SCHEDULE = {
+    # Daily savings interest — runs at midnight Lagos time
+    'accrue-savings-interest-daily': {
+        'task': 'apps.financial_services.tasks.accrue_daily_savings_interest',
+        'schedule': crontab(hour=0, minute=0),
+    },
+    # Insurance premium deduction — runs at 6am daily
+    'deduct-insurance-premiums-daily': {
+        'task': 'apps.financial_services.tasks.deduct_daily_insurance_premiums',
+        'schedule': crontab(hour=6, minute=0),
+    },
+    # Loan repayment check — runs every Monday at 8am
+    'check-loan-repayments-weekly': {
+        'task': 'apps.financial_services.tasks.process_weekly_loan_repayments',
+        'schedule': crontab(hour=8, minute=0, day_of_week=1),
+    },
+    # Fraud detection sweep — runs every hour
+    'fraud-sweep-hourly': {
+        'task': 'apps.financial_services.tasks.fraud_detection_sweep',
+        'schedule': crontab(minute=0),
+    },
+    # Marketplace: expire old listings at 1am
+    'expire-old-listings-daily': {
+        'task': 'apps.marketplace.tasks.expire_old_listings',
+        'schedule': crontab(hour=1, minute=0),
+    },
+    # Marketplace: fraud sweep every hour
+    'flag-suspicious-listings-hourly': {
+        'task': 'apps.marketplace.tasks.flag_suspicious_listings',
+        'schedule': crontab(minute=30),  # offset from main fraud sweep
+    },
+}
