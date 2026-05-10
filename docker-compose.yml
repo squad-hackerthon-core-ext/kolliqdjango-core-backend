@@ -1,35 +1,154 @@
-version: '3.9'
+# ══════════════════════════════════════════════════════════════════
+# Kolliq — Local Development Docker Compose
+# Runs the full stack: Django + Celery + Redis
+# Connects to your remote Supabase PostgreSQL (not local Postgres)
+#
+# Usage:
+#   docker-compose up --build          # first run
+#   docker-compose up                  # subsequent runs
+#   docker-compose up django           # just Django
+#   docker-compose logs -f celery      # watch Celery
+#   docker-compose down                # stop everything
+#   docker-compose down -v             # stop + remove volumes
+# ══════════════════════════════════════════════════════════════════
+
+# ── Shared config applied to all Django-based services ───────────
+x-django-base: &django-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: final
+  env_file:
+    - .env
+  volumes:
+    # Mount source code for hot reload in dev
+    - .:/app
+    - /app/staticfiles    # exclude staticfiles from mount
+    - /app/__pycache__    # exclude pycache
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  networks:
+    - kolliq-net
 
 services:
-  web:
-    build: .
+
+  # ── Django API server ─────────────────────────────────────────
+  django:
+    <<: *django-base
+    container_name: kolliq-django
     ports:
       - "8000:8000"
-    env_file:
-      - .env
-    depends_on:
-      - redis
-    volumes:
-      - .:/app
-    command: python manage.py runserver 0.0.0.0:8000
+    command: >
+      sh -c "
+        echo '⏳ Waiting for database...' &&
+        python manage.py wait_for_db &&
+        echo '📦 Running migrations...' &&
+        python manage.py migrate --noinput &&
+        echo '🌱 Seeding if needed...' &&
+        python manage.py seed_pilot --skip-if-exists &&
+        echo '✅ Django starting...' &&
+        python manage.py runserver 0.0.0.0:8000
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    labels:
+      - "traefik.enable=false"
 
+  # ── Celery worker (async tasks) ───────────────────────────────
   celery:
-    build: .
-    env_file:
-      - .env
-    depends_on:
-      - redis
-    command: celery -A kolliq worker -l info
+    <<: *django-base
+    container_name: kolliq-celery
+    command: >
+      sh -c "
+        echo '⏳ Waiting for Django to be ready...' &&
+        sleep 10 &&
+        echo '🔄 Celery worker starting...' &&
+        celery -A kolliq worker
+          --loglevel=info
+          --concurrency=2
+          --queues=default,payments,notifications,scoring
+          --hostname=worker@%h
+      "
+    healthcheck:
+      test: ["CMD", "celery", "-A", "kolliq", "inspect", "ping",
+             "--destination", "worker@*", "--timeout", "5"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
 
+  # ── Celery Beat (scheduled tasks) ────────────────────────────
   celery-beat:
-    build: .
-    env_file:
-      - .env
-    depends_on:
-      - redis
-    command: celery -A kolliq beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    <<: *django-base
+    container_name: kolliq-celery-beat
+    command: >
+      sh -c "
+        echo '⏳ Waiting for Django...' &&
+        sleep 15 &&
+        echo '⏰ Celery beat starting...' &&
+        celery -A kolliq beat
+          --loglevel=info
+          --scheduler django_celery_beat.schedulers:DatabaseScheduler
+          --pidfile=/tmp/celerybeat.pid
+      "
+    # Beat should only ever run ONE instance
+    # Running multiple beats causes duplicate task execution
+    deploy:
+      replicas: 1
 
+  # ── Redis (local — broker + cache + sessions) ─────────────────
   redis:
-    image: redis:7-alpine
+    image: redis:7.2-alpine
+    container_name: kolliq-redis
     ports:
       - "6379:6379"
+    command: >
+      redis-server
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --save 60 1
+        --loglevel warning
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - kolliq-net
+
+  # ── Redis Commander (Redis GUI — dev only) ────────────────────
+  redis-ui:
+    image: rediscommander/redis-commander:latest
+    container_name: kolliq-redis-ui
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - kolliq-net
+    profiles:
+      - tools    # only starts with: docker-compose --profile tools up
+
+# ── Volumes ───────────────────────────────────────────────────────
+volumes:
+  redis-data:
+    driver: local
+
+# ── Networks ──────────────────────────────────────────────────────
+networks:
+  kolliq-net:
+    driver: bridge
+    name: kolliq-network

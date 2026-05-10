@@ -1,0 +1,67 @@
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# ── Virtual environments ──────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+
+# ── Django ────────────────────────────────────────────────────────
+*.sqlite3
+staticfiles/
+mediafiles/
+htmlcov/
+.coverage
+
+# ── Testing ───────────────────────────────────────────────────────
+.pytest_cache/
+pytest_cache/
+.tox/
+
+# ── Environment ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Docker ────────────────────────────────────────────────────────
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# ── Version control ───────────────────────────────────────────────
+.git/
+.gitignore
+.github/
+
+# ── IDE ───────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# ── Docs ──────────────────────────────────────────────────────────
+*.md
+*.pdf
+docs/
+
+# ── Logs ──────────────────────────────────────────────────────────
+*.log
+logs/

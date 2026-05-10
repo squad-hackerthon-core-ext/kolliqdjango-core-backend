@@ -1,0 +1,127 @@
+# ══════════════════════════════════════════════════════════════════
+# Kolliq — Integration Test Docker Compose
+# Runs Django + Node.js together to test the full call map
+#
+# Prerequisites:
+#   - Node repo must be in ../kolliq-node/ relative to this file
+#   - Both .env files must be filled
+#
+# Usage:
+#   docker-compose -f docker-compose.integration.yml up --build
+#   docker-compose -f docker-compose.integration.yml down
+# ══════════════════════════════════════════════════════════════════
+
+version: '3.9'
+
+x-django-base: &django-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  depends_on:
+    redis:
+      condition: service_healthy
+  networks:
+    - kolliq-integration
+  restart: unless-stopped
+
+services:
+
+  # ── Django API ────────────────────────────────────────────────
+  django:
+    <<: *django-base
+    container_name: kolliq-django-int
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "
+        python manage.py wait_for_db &&
+        python manage.py migrate --noinput &&
+        python manage.py seed_pilot --skip-if-exists &&
+        gunicorn kolliq.wsgi:application
+          --bind 0.0.0.0:8000
+          --workers 2
+          --timeout 30
+          --log-level info
+          --access-logfile -
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+
+  # ── Celery worker ─────────────────────────────────────────────
+  celery:
+    <<: *django-base
+    container_name: kolliq-celery-int
+    command: >
+      sh -c "sleep 15 &&
+        celery -A kolliq worker --loglevel=info --concurrency=2"
+    depends_on:
+      django:
+        condition: service_healthy
+
+  # ── Celery beat ───────────────────────────────────────────────
+  celery-beat:
+    <<: *django-base
+    container_name: kolliq-beat-int
+    command: >
+      sh -c "sleep 20 &&
+        celery -A kolliq beat --loglevel=info
+          --scheduler django_celery_beat.schedulers:DatabaseScheduler"
+    depends_on:
+      django:
+        condition: service_healthy
+
+  # ── Node.js service ───────────────────────────────────────────
+  # Expects the Node repo to be at ../kolliq-node/
+  # If your Node folder has a different name, update context path
+  node:
+    build:
+      context: ../kolliq-node
+      dockerfile: Dockerfile
+    container_name: kolliq-node-int
+    ports:
+      - "3000:3000"
+    env_file:
+      - ../kolliq-node/.env
+    environment:
+      # Override Django URL to use Docker service name
+      - DJANGO_BASE_URL=http://django:8000
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      django:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - kolliq-integration
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Redis ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: kolliq-redis-int
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kolliq-integration
+    restart: unless-stopped
+
+networks:
+  kolliq-integration:
+    driver: bridge
+    name: kolliq-integration-network
