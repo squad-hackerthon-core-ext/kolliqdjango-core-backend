@@ -7,11 +7,26 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
+from django.db import connection
 
 User = get_user_model()
 
+@pytest.fixture(autouse=True)
+def ensure_db_connection():
+    """Ensure database connection is alive before each test"""
+    connection.ensure_connection()
+    yield
+    # Don't close here - let Django handle it
 
 # ── API client helpers ────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def celery_eager(settings):
+    """Force Celery tasks to run synchronously in tests."""
+    settings.CELERY_TASK_ALWAYS_EAGER = True
+    settings.CELERY_TASK_EAGER_PROPAGATES = True
+    yield
+
 
 @pytest.fixture
 def api_client():

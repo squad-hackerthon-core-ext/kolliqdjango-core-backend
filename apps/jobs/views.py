@@ -195,40 +195,42 @@ class JobCompleteView(APIView):
         worker_id = request.data.get('worker_id')
 
         with db_transaction.atomic():
-            # Get application(s) to complete
             if worker_id:
                 applications = job.applications.filter(
                     worker_id=worker_id,
-                    status=JobApplication.Status.ACCEPTED
+                    status=JobApplication.Status.ACCEPTED,
                 )
             else:
                 applications = job.applications.filter(
-                    status=JobApplication.Status.ACCEPTED
+                    status=JobApplication.Status.ACCEPTED,
                 )
 
             if not applications.exists():
                 return error_response('No accepted workers found for this job.')
 
-            # Mark applications complete
-            applications.update(
-                status=JobApplication.Status.COMPLETED,
-                completed_at=timezone.now()
+            # Capture IDs BEFORE update so we can count and iterate after
+            worker_ids = list(
+                applications.values_list('worker_id', flat=True)
             )
 
-            # Mark job complete
+            applications.update(
+                status=JobApplication.Status.COMPLETED,
+                completed_at=timezone.now(),
+            )
+
             job.status = Job.Status.COMPLETED
             job.save(update_fields=['status', 'updated_at'])
 
-        # Release escrow for each completed worker async
-        from apps.payments.tasks import release_escrow_for_job
-        for app in applications:
-            release_escrow_for_job.delay(str(job.id), str(app.worker_id))
+            # Release escrow per worker
+            from apps.payments.tasks import release_escrow_for_job
+            for wid in worker_ids:
+                release_escrow_for_job.delay(str(job.id), str(wid))
 
         return success_response({
             'job_id': str(job.id),
             'status': 'completed',
-            'workers_paid': applications.count(),
-            'message': 'Job confirmed. Payments are being released to workers.',
+            'workers_paid': len(worker_ids),
+            'message': 'Job confirmed. Payments released.',
         })
 
 

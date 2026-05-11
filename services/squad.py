@@ -118,11 +118,14 @@ class SquadService:
         customer_identifier: str,
         first_name: str,
         last_name: str,
+        middle_name: str,
         phone: str,
         email: str,
         dob: str = '',
+        bvn: str = '',
         gender: str = '1',
         address: str = '',
+        beneficiary_account: str = '',
     ) -> dict:
         """
         POST /virtual-account
@@ -150,13 +153,14 @@ class SquadService:
             'customer_identifier': customer_identifier,
             'first_name': first_name,
             'last_name': last_name,
-            'middle_name': '',
+            'middle_name': middle_name,
             'mobile_num': phone_clean[:11],
             'email': email,
             'dob': dob,                    # format: mm/dd/yyyy
             'gender': gender,               # '1' = Male, '2' = Female
             'address': address,
-            'beneficiary_account': self.beneficiary_account,
+            'bvn': bvn,
+            'beneficiary_account': beneficiary_account or self.beneficiary_account,
         }
 
         result = self._post('/virtual-account', payload)

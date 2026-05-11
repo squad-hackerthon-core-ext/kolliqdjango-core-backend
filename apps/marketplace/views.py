@@ -196,6 +196,156 @@ class ListingUpdateView(APIView):
         )
 
 
+class ListingPurchaseView(APIView):
+    """
+    POST /api/marketplace/listings/<id>/purchase/
+    Buyer purchases a listing using their Kolliq wallet balance.
+    Pure internal ledger — no Squad API call.
+
+    Body:
+        quantity: integer   (default 1)
+        message: string     (optional note to seller)
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, listing_id):
+        from apps.marketplace.models import Listing, Enquiry
+        from apps.payments.models import Transaction
+        from django.db import transaction as db_transaction
+        from django.shortcuts import get_object_or_404
+        from decimal import Decimal
+
+        buyer = request.user
+        listing = get_object_or_404(
+            Listing, id=listing_id, status='active'
+        )
+
+        if listing.seller == buyer:
+            return error_response('You cannot purchase your own listing.')
+
+        quantity = int(request.data.get('quantity', 1))
+        if quantity < 1:
+            return error_response('Quantity must be at least 1.')
+
+        if quantity > listing.quantity_available:
+            return error_response(
+                f'Only {listing.quantity_available} available.'
+            )
+
+        total = listing.price * quantity
+        PLATFORM_CUT = (total * Decimal('0.02')).quantize(Decimal('0.01'))
+        seller_receives = total - PLATFORM_CUT
+
+        # Check buyer balance
+        try:
+            buyer_wallet = buyer.wallet
+        except Exception:
+            return error_response('Your wallet is not ready.', status=404)
+
+        if buyer_wallet.balance < total:
+            return error_response(
+                f'Insufficient balance. '
+                f'Need ₦{total}, you have ₦{buyer_wallet.balance}. '
+                f'Top up your wallet first.'
+            )
+
+        seller = listing.seller
+        try:
+            seller_wallet = seller.wallet
+        except Exception:
+            return error_response("Seller's wallet is not ready.")
+
+        reference = f"MKT-{listing.id}-{buyer.id}"[:40]
+
+        with db_transaction.atomic():
+            # Lock both wallets
+            buyer_wallet = type(buyer_wallet).objects.select_for_update().get(
+                user=buyer
+            )
+            seller_wallet = type(seller_wallet).objects.select_for_update().get(
+                user=seller
+            )
+
+            # Re-check after lock
+            if buyer_wallet.balance < total:
+                return error_response(
+                    f'Insufficient balance: ₦{buyer_wallet.balance}.'
+                )
+
+            # Debit buyer
+            buyer_wallet.debit(total)
+
+            # Credit seller (minus platform cut)
+            seller_wallet.credit(seller_receives)
+
+            # Reduce listing quantity
+            listing.quantity_available -= quantity
+            if listing.quantity_available == 0:
+                listing.status = 'sold'
+            listing.save(update_fields=[
+                'quantity_available', 'status', 'updated_at'
+            ])
+
+            # Transaction records
+            Transaction.objects.create(
+                user=buyer,
+                transaction_type=Transaction.Type.DEBIT,
+                amount=total,
+                status=Transaction.Status.SUCCESS,
+                related_user=seller,
+                description=f'Purchase: {listing.title} x{quantity}',
+                metadata={
+                    'type': 'marketplace_purchase',
+                    'listing_id': str(listing.id),
+                    'quantity': quantity,
+                    'reference': reference,
+                }
+            )
+            Transaction.objects.create(
+                user=seller,
+                transaction_type=Transaction.Type.CREDIT,
+                amount=seller_receives,
+                status=Transaction.Status.SUCCESS,
+                related_user=buyer,
+                description=f'Sale: {listing.title} x{quantity}',
+                metadata={
+                    'type': 'marketplace_sale',
+                    'listing_id': str(listing.id),
+                    'platform_fee': str(PLATFORM_CUT),
+                    'reference': reference,
+                }
+            )
+
+        # Notify seller
+        from services.africas_talking import ATService
+        at = ATService()
+        at.send_sms(
+            seller.phone,
+            f"Kolliq: {buyer.display_name} bought {quantity}x "
+            f"'{listing.title}' for ₦{seller_receives}. "
+            f"Balance: ₦{seller_wallet.balance}."
+        )
+
+        # Recalculate seller score
+        from apps.scoring.tasks import recalculate_score
+        recalculate_score.delay(str(seller.id))
+
+        return success_response({
+            'reference': reference,
+            'listing': listing.title,
+            'quantity': quantity,
+            'total_paid': str(total),
+            'platform_fee': str(PLATFORM_CUT),
+            'seller_received': str(seller_receives),
+            'your_new_balance': str(buyer_wallet.balance),
+            'status': 'completed',
+            'message': (
+                f'Purchase complete! ₦{total} paid. '
+                f'Contact {seller.display_name} to arrange pickup.'
+            ),
+        }, status=201)
+
+
 class ListingDeleteView(APIView):
     """DELETE /api/marketplace/listings/<id>/delete/"""
     permission_classes = [IsAuthenticated]

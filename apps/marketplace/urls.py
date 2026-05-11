@@ -12,6 +12,7 @@ urlpatterns = [
     path('listings/create/', views.ListingCreateView.as_view(), name='listing-create'),
     path('listings/<uuid:listing_id>/', views.ListingDetailView.as_view(), name='listing-detail'),
     path('listings/<uuid:listing_id>/update/', views.ListingUpdateView.as_view(), name='listing-update'),
+    path('listings/<uuid:listing_id>/purchase/', views.ListingPurchaseView.as_view(), name='listing-purchase'),
     path('listings/<uuid:listing_id>/delete/', views.ListingDeleteView.as_view(), name='listing-delete'),
     path('listings/<uuid:listing_id>/images/', views.ListingImageAddView.as_view(), name='listing-images'),
     path('listings/<uuid:listing_id>/save/', views.SaveListingView.as_view(), name='listing-save'),

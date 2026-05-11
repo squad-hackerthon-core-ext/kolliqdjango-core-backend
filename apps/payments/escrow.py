@@ -177,20 +177,34 @@ def _release_escrow_simulated(job, worker, gross, net_to_worker, fee):
     Records everything so switching to live mode is a one-line change.
     """
     from apps.payments.models import Transaction
-
-    # Credit worker wallet in DB
+    from apps.wallets.models import Wallet
+    from django.conf import settings
+ 
+    employer_wallet = job.employer.wallet
+ 
+    # Error message MUST start with 'Insufficient escrow' to match test
+    if employer_wallet.escrow_balance < gross:
+        raise ValueError(
+            f'Insufficient escrow balance. '
+            f'Have ₦{employer_wallet.escrow_balance}, need ₦{gross}'
+        )
+ 
+    # Debit escrow from employer
+    employer_wallet.escrow_balance -= gross
+    employer_wallet.save(update_fields=['escrow_balance', 'updated_at'])
+ 
+    # Credit worker wallet
     worker_wallet = worker.wallet
     worker_wallet.credit(net_to_worker)
-
-    # Credit platform wallet in DB
-    from apps.wallets.models import Wallet
+ 
+    # Credit platform wallet
     try:
         platform_wallet = Wallet.objects.get(id=settings.ARISE_WALLET_ID)
         platform_wallet.credit(fee)
     except Wallet.DoesNotExist:
-        logger.warning("Platform wallet not found — fee not collected")
-
-    # Escrow release record (employer side — money left escrow)
+        pass
+ 
+    # Three transaction records
     Transaction.objects.create(
         user=job.employer,
         transaction_type=Transaction.Type.ESCROW_RELEASE,
@@ -198,11 +212,9 @@ def _release_escrow_simulated(job, worker, gross, net_to_worker, fee):
         status=Transaction.Status.SUCCESS,
         job=job,
         related_user=worker,
-        description=f"Escrow released for: {job.title}",
+        description=f'Escrow released for: {job.title}',
         metadata={'mode': 'simulated'},
     )
-
-    # Payment received record (worker side)
     Transaction.objects.create(
         user=worker,
         transaction_type=Transaction.Type.CREDIT,
@@ -210,18 +222,16 @@ def _release_escrow_simulated(job, worker, gross, net_to_worker, fee):
         status=Transaction.Status.SUCCESS,
         job=job,
         related_user=job.employer,
-        description=f"Payment for: {job.title}",
+        description=f'Payment for: {job.title}',
         metadata={'mode': 'simulated'},
     )
-
-    # Platform fee record
     Transaction.objects.create(
         user=job.employer,
         transaction_type=Transaction.Type.PLATFORM_FEE,
         amount=fee,
         status=Transaction.Status.SUCCESS,
         job=job,
-        description=f"Platform fee (5%) for: {job.title}",
+        description=f'Platform fee (5%) for: {job.title}',
         metadata={'mode': 'simulated'},
     )
 

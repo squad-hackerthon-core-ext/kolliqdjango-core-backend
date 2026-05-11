@@ -1,4 +1,5 @@
 from django.contrib import admin
+from unfold.admin import ModelAdmin
 from django.db.models import Avg
 from .models import Job, JobApplication, Rating
 

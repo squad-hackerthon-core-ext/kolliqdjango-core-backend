@@ -1,75 +1,110 @@
 from rest_framework import serializers
-from .models import User
+from apps.users.models import User
 
 
-class UserCreateSerializer(serializers.ModelSerializer):
+class UserSerializer(serializers.ModelSerializer):
+    """Read serializer — returned on all user responses."""
+
     class Meta:
         model = User
         fields = [
-            'phone', 'full_name', 'role', 'channel',
-            'location_area', 'location_city', 'location_lat', 'location_lng',
-            'skills', 'languages', 'has_vehicle', 'vehicle_type', 'availability',
-            'trade_category', 'market_name', 'weekly_income_range',
+            'id',
+            'phone',
+            'full_name',
+            'email',
+            'role',
+            'gender',
+            'date_of_birth',
+            'address',
+            'location_area',
+            'location_city',
+            'location_lat',
+            'location_lng',
+            'skills',
+            'languages',
+            'has_vehicle',
+            'vehicle_type',
+            'availability',
+            'trade_category',
+            'market_name',
+            'weekly_income_range',
             'business_name',
+            'channel',
+            'is_active',
+            'is_verified',
+            'onboarding_complete',
+            'squad_account_number',
+            'squad_bank_name',
+            'squad_account_status',
+            'squad_account_created_at',
+            'last_login',
+            'created_at',
         ]
+        read_only_fields = fields  # This serializer is read-only
+
+
+class UserCreateSerializer(serializers.Serializer):
+    """Write serializer — validates incoming data for user creation."""
+
+    phone = serializers.CharField(max_length=20)
+    full_name = serializers.CharField(max_length=255, required=False, default='')
+    email = serializers.EmailField(required=False, allow_null=True)
+    role = serializers.ChoiceField(
+        choices=[(r.value, r.name) for r in User.Role],
+        required=False,
+        default=User.Role.WORKER
+    )
+    gender = serializers.ChoiceField(
+        choices=[('M', 'Male'), ('F', 'Female'), ('O', 'Other')],
+        required=False,
+        allow_null=True
+    )
+    date_of_birth = serializers.DateField(required=False, allow_null=True)
+    bvn = serializers.CharField(max_length=11, required=False, allow_blank=True, allow_null=True)
+    address = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    location_area = serializers.CharField(max_length=255, required=False, default='')
+    location_city = serializers.CharField(max_length=255, required=False, default='Lagos')
+    skills = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    languages = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    has_vehicle = serializers.BooleanField(required=False, default=False)
+    vehicle_type = serializers.CharField(max_length=50, required=False, default='none')
+    availability = serializers.ChoiceField(
+        choices=[(a.value, a.name) for a in User.Availability],
+        required=False,
+        default=User.Availability.FULL_DAY
+    )
+    trade_category = serializers.CharField(max_length=255, required=False, default='')
+    market_name = serializers.CharField(max_length=255, required=False, default='')
+    weekly_income_range = serializers.CharField(max_length=100, required=False, default='')
+    business_name = serializers.CharField(max_length=255, required=False, default='')
+    channel = serializers.CharField(max_length=50, required=False, default='app')
+    pin = serializers.CharField(min_length=4, max_length=6, write_only=True, required=False)
 
     def validate_phone(self, value):
-        # Normalise: strip spaces, ensure +234 prefix
+        # Normalise: strip spaces, ensure it starts with a digit or +
         value = value.strip().replace(' ', '')
-        if value.startswith('0'):
-            value = '+234' + value[1:]
-        if not value.startswith('+234'):
-            raise serializers.ValidationError('Phone must be a valid Nigerian number.')
+        if not value:
+            raise serializers.ValidationError("Phone number cannot be empty.")
+        return value
+
+    def validate_bvn(self, value):
+        if value and not value.isdigit():
+            raise serializers.ValidationError("BVN must contain only digits.")
+        if value and len(value) != 11:
+            raise serializers.ValidationError("BVN must be exactly 11 digits.")
         return value
 
 
-class UserProfileSerializer(serializers.ModelSerializer):
-    economic_score = serializers.SerializerMethodField()
-    wallet_balance = serializers.SerializerMethodField()
-    unlocked_services = serializers.SerializerMethodField()
+class LoginSerializer(serializers.Serializer):
+    """Validates login credentials (phone + PIN)."""
 
-    class Meta:
-        model = User
-        fields = [
-            'id', 'phone', 'full_name', 'role', 'channel',
-            'location_area', 'location_city',
-            'skills', 'languages', 'has_vehicle', 'vehicle_type', 'availability',
-            'trade_category', 'market_name',
-            'business_name',
-            'is_verified', 'onboarding_complete',
-            'economic_score', 'wallet_balance', 'unlocked_services',
-            'created_at',
-        ]
+    phone = serializers.CharField(max_length=20)
+    pin = serializers.CharField(min_length=4, max_length=6, write_only=True)
 
-    def get_economic_score(self, obj):
-        try:
-            return obj.economic_score.score
-        except Exception:
-            return 0
+    def validate_phone(self, value):
+        return value.strip().replace(' ', '')
 
-    def get_wallet_balance(self, obj):
-        try:
-            return str(obj.wallet.balance)
-        except Exception:
-            return '0.00'
-
-    def get_unlocked_services(self, obj):
-        from apps.scoring.engine import get_unlocked_services
-        try:
-            score = obj.economic_score.score
-            return get_unlocked_services(score)
-        except Exception:
-            return []
-
-
-class UserOnboardingSerializer(serializers.ModelSerializer):
-    """Used to complete onboarding after account is created."""
-    class Meta:
-        model = User
-        fields = [
-            'full_name', 'location_area', 'location_city',
-            'location_lat', 'location_lng',
-            'skills', 'languages', 'has_vehicle', 'vehicle_type', 'availability',
-            'trade_category', 'market_name', 'weekly_income_range',
-            'business_name', 'onboarding_complete',
-        ]
+    def validate_pin(self, value):
+        if not value.isdigit():
+            raise serializers.ValidationError("PIN must contain digits only.")
+        return value

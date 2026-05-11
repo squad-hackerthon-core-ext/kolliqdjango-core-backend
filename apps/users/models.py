@@ -1,101 +1,129 @@
-from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
-from django.db import models
 import uuid
+from django.db import models
+from django.contrib.auth.hashers import make_password, check_password
+from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
 
 
 class UserManager(BaseUserManager):
-    def create_user(self, phone, **extra_fields):
+    """Custom manager — phone is the unique identifier, not username."""
+
+    def create_user(self, phone, pin=None, **extra_fields):
         if not phone:
-            raise ValueError('Phone number is required')
+            raise ValueError("Phone number is required.")
         user = self.model(phone=phone, **extra_fields)
-        user.set_unusable_password()
+        if pin:
+            user.set_pin(pin)
         user.save(using=self._db)
         return user
 
-    def create_superuser(self, phone, password=None, **extra_fields):
+    def create_superuser(self, phone, pin=None, **extra_fields):
         extra_fields.setdefault('is_staff', True)
         extra_fields.setdefault('is_superuser', True)
-        user = self.model(phone=phone, **extra_fields)
-        user.set_password(password)
-        user.save(using=self._db)
-        return user
+        return self.create_user(phone, pin=pin, **extra_fields)
 
 
-class User(AbstractBaseUser, PermissionsMixin):
+class User(AbstractBaseUser):
+    """
+    Custom user model.
+    - Phone is the login identifier.
+    - PIN is hashed (not password) — use set_pin / check_pin.
+    - Token-based auth via DRF's TokenAuthentication.
+    """
 
+    # ------------------------------------------------------------------ #
+    #  Choices
+    # ------------------------------------------------------------------ #
     class Role(models.TextChoices):
         WORKER = 'worker', 'Worker'
-        TRADER = 'trader', 'Trader'
         EMPLOYER = 'employer', 'Employer'
-
-    class Skill(models.TextChoices):
-        DELIVERY = 'delivery', 'Delivery/Dispatch'
-        COOKING = 'cooking', 'Cooking/Catering'
-        CONSTRUCTION = 'construction', 'Construction/Labour'
-        MARKET = 'market', 'Market Assistant'
-        CLEANING = 'cleaning', 'Cleaning'
-        SECURITY = 'security', 'Security'
-        TEACHING = 'teaching', 'Teaching/Tutoring'
-        OTHER = 'other', 'Other'
+        ADMIN = 'admin', 'Admin'
 
     class Availability(models.TextChoices):
-        MORNINGS = 'mornings', 'Mornings'
-        AFTERNOONS = 'afternoons', 'Afternoons'
-        EVENINGS = 'evenings', 'Evenings'
         FULL_DAY = 'full_day', 'Full Day'
+        MORNING = 'morning', 'Morning'
+        AFTERNOON = 'afternoon', 'Afternoon'
+        EVENING = 'evening', 'Evening'
+        WEEKENDS = 'weekends', 'Weekends'
 
+    class Gender(models.TextChoices):
+        MALE = 'M', 'Male'
+        FEMALE = 'F', 'Female'
+        OTHER = 'O', 'Other'
+
+    # ------------------------------------------------------------------ #
+    #  Core identity
+    # ------------------------------------------------------------------ #
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    phone = models.CharField(max_length=20, unique=True)
-    full_name = models.CharField(max_length=200, blank=True)
+    phone = models.CharField(max_length=20, unique=True, db_index=True)
+    pin = models.CharField(max_length=128, blank=True)  # Hashed PIN
+
+    # ------------------------------------------------------------------ #
+    #  Profile
+    # ------------------------------------------------------------------ #
+    full_name = models.CharField(max_length=255, blank=True, default='')
+    email = models.EmailField(blank=True, null=True)
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.WORKER)
+    gender = models.CharField(max_length=1, choices=Gender.choices, blank=True, null=True)
+    date_of_birth = models.DateField(blank=True, null=True)
+    bvn = models.CharField(max_length=11, blank=True, null=True)
+    address = models.TextField(blank=True, null=True)
 
-    # Location
-    location_area = models.CharField(max_length=200, blank=True)
-    location_city = models.CharField(max_length=100, blank=True, default='Lagos')
-    location_lat = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
-    location_lng = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    # ------------------------------------------------------------------ #
+    #  Location
+    # ------------------------------------------------------------------ #
+    location_area = models.CharField(max_length=255, blank=True, default='')
+    location_city = models.CharField(max_length=255, blank=True, default='Lagos')
+    location_lat = models.DecimalField(max_digits=9, decimal_places=6, blank=True, null=True)
+    location_lng = models.DecimalField(max_digits=9, decimal_places=6, blank=True, null=True)
 
-    # Worker-specific
-    skills = models.JSONField(default=list, blank=True)          # list of Skill values
-    languages = models.JSONField(default=list, blank=True)       # ['english', 'yoruba', ...]
+    # ------------------------------------------------------------------ #
+    #  Work profile
+    # ------------------------------------------------------------------ #
+    skills = models.JSONField(default=list, blank=True)
+    languages = models.JSONField(default=list, blank=True)
     has_vehicle = models.BooleanField(default=False)
-    vehicle_type = models.CharField(
-        max_length=20,
-        choices=[('bike', 'Bike'), ('car', 'Car'), ('none', 'None')],
-        default='none'
-    )
+    vehicle_type = models.CharField(max_length=50, blank=True, default='none')
     availability = models.CharField(
-        max_length=20,
-        choices=Availability.choices,
-        default=Availability.FULL_DAY
+        max_length=20, choices=Availability.choices, default=Availability.FULL_DAY
     )
+    trade_category = models.CharField(max_length=255, blank=True, default='')
+    market_name = models.CharField(max_length=255, blank=True, default='')
+    weekly_income_range = models.CharField(max_length=100, blank=True, default='')
+    business_name = models.CharField(max_length=255, blank=True, default='')
 
-    # Trader-specific
-    trade_category = models.CharField(max_length=100, blank=True)
-    market_name = models.CharField(max_length=200, blank=True)
-    weekly_income_range = models.CharField(max_length=50, blank=True)
-
-    # Employer-specific
-    business_name = models.CharField(max_length=200, blank=True)
-
-    # Status
+    # ------------------------------------------------------------------ #
+    #  Meta / acquisition
+    # ------------------------------------------------------------------ #
+    channel = models.CharField(max_length=50, blank=True, default='app')
     is_active = models.BooleanField(default=True)
-    is_staff = models.BooleanField(default=False)
     is_verified = models.BooleanField(default=False)
-    is_flagged = models.BooleanField(default=False)
-    flag_reason = models.TextField(blank=True)
-
-    # Onboarding
+    is_staff = models.BooleanField(default=False)
+    is_superuser = models.BooleanField(default=False)
     onboarding_complete = models.BooleanField(default=False)
-    channel = models.CharField(
-        max_length=20,
-        choices=[('app', 'App'), ('ussd', 'USSD'), ('whatsapp', 'WhatsApp')],
-        default='app'
-    )
 
+    # ------------------------------------------------------------------ #
+    #  Squad virtual account
+    # ------------------------------------------------------------------ #
+    squad_account_number = models.CharField(max_length=20, blank=True, null=True)
+    squad_bank_name = models.CharField(max_length=100, blank=True, null=True)
+    squad_account_status = models.CharField(
+        max_length=20,
+        blank=True,
+        null=True,
+        choices=[('active', 'Active'), ('failed', 'Failed'), ('pending', 'Pending')]
+    )
+    squad_account_created_at = models.DateTimeField(blank=True, null=True)
+
+    # ------------------------------------------------------------------ #
+    #  Timestamps
+    # ------------------------------------------------------------------ #
+    last_login = models.DateTimeField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # ------------------------------------------------------------------ #
+    #  Auth config
+    # ------------------------------------------------------------------ #
     USERNAME_FIELD = 'phone'
     REQUIRED_FIELDS = []
 
@@ -103,19 +131,29 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     class Meta:
         db_table = 'users'
-        indexes = [
-            models.Index(fields=['phone']),
-            models.Index(fields=['role']),
-            models.Index(fields=['location_city']),
-        ]
+        verbose_name = 'User'
+        verbose_name_plural = 'Users'
+        ordering = ['-created_at']
 
     def __str__(self):
-        return f"{self.full_name or 'Unknown'} ({self.phone}) — {self.role}"
+        return f"{self.full_name or self.phone} ({self.role})"
 
-    @property
-    def display_name(self):
-        return self.full_name or self.phone
+    # ------------------------------------------------------------------ #
+    #  PIN helpers  (NOT Django's password field)
+    # ------------------------------------------------------------------ #
+    def set_pin(self, raw_pin: str):
+        """Hash and store a PIN."""
+        self.pin = make_password(raw_pin)
 
-    @property
-    def primary_skill(self):
-        return self.skills[0] if self.skills else None
+    def check_pin(self, raw_pin: str) -> bool:
+        """Return True if raw_pin matches the stored hash."""
+        return check_password(raw_pin, self.pin)
+
+    # ------------------------------------------------------------------ #
+    #  Django permission shim (required by AbstractBaseUser)
+    # ------------------------------------------------------------------ #
+    def has_perm(self, perm, obj=None):
+        return self.is_superuser
+
+    def has_module_perms(self, app_label):
+        return self.is_superuser

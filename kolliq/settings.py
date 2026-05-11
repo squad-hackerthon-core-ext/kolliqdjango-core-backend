@@ -12,6 +12,8 @@ DEBUG = env('DEBUG')
 ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=['localhost','.ngrok-free.dev'])
 
 DJANGO_APPS = [
+    'unfold',
+    'unfold.contrib.filters',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -23,6 +25,7 @@ DJANGO_APPS = [
 THIRD_PARTY_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'drf_spectacular',
     'corsheaders',
     'django_celery_beat',
@@ -75,20 +78,38 @@ WSGI_APPLICATION = 'kolliq.wsgi.application'
 
 # Database
 DATABASES = {
-    'default': env.db('DATABASE_URL', default='sqlite:///db.sqlite3')
+    'default': {
+        **env.db('DATABASE_URL', default='sqlite:///db.sqlite3'),
+        'CONN_MAX_AGE': 0,
+        'OPTIONS': {
+            'connect_timeout': 10,
+            'keepalives': 1,
+            'keepalives_idle': 60,
+            'keepalives_interval': 10,
+            'keepalives_count': 5,
+        }
+    }
 }
+
+REDIS_URL = env('REDIS_URL', default='redis://localhost:6379/0')
 
 # Cache / Redis
 CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-        'LOCATION': env('REDIS_URL', default='redis://localhost:6379/0'),
+        'LOCATION': REDIS_URL,
+        'OPTIONS': {
+            'socket_connect_timeout': 5,
+            'socket_timeout': 5,
+            'retry_on_timeout': True,
+        }
     }
 }
 
+
 # Celery
-CELERY_BROKER_URL = env('REDIS_URL', default='redis://localhost:6379/0')
-CELERY_RESULT_BACKEND = env('REDIS_URL', default='redis://localhost:6379/0')
+CELERY_BROKER_URL = REDIS_URL
+CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
@@ -108,6 +129,14 @@ REST_FRAMEWORK = {
     ),
     'EXCEPTION_HANDLER': 'kolliq.utils.custom_exception_handler',
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+from datetime import timedelta
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
+    'ROTATE_REFRESH_TOKENS': True,
+    'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
 SPECTACULAR_SETTINGS = {
@@ -158,7 +187,26 @@ SIMPLE_JWT = {
     'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
 }
 
-CORS_ALLOW_ALL_ORIGINS = DEBUG
+if DEBUG:
+    CORS_ALLOW_ALL_ORIGINS = True
+else:
+    CORS_ALLOW_ALL_ORIGINS = False
+    CORS_ALLOWED_ORIGINS = env.list('CORS_ALLOWED_ORIGINS', default=[])
+ 
+
+
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'origin',
+    'x-internal-secret',     # Node → Django internal webhook auth
+    'x-partner-secret',      # Partner API auth
+    'x-squad-signature',     # Squad webhook signature
+    'x-requested-with',
+]
+
 
 # Squad
 SQUAD_SECRET_KEY = env('SQUAD_SECRET_KEY', default='')
@@ -195,11 +243,14 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # ── System Virtual Accounts (created once at deploy, never change) ──────────
 KOLLIQ_ESCROW_VIRTUAL_ACCOUNT = env('KOLLIQ_ESCROW_VIRTUAL_ACCOUNT', default='')
 KOLLIQ_PLATFORM_VIRTUAL_ACCOUNT = env('KOLLIQ_PLATFORM_VIRTUAL_ACCOUNT', default='')
-SQUAD_ESCROW_CUSTOMER_ID = env('SQUAD_ESCROW_CUSTOMER_ID', default='kolliq-escrow')
+SQUAD_MERCHANT_ID = env('SQUAD_MERCHANT_ID', default='')
+KOLLIQ_ESCROW_CUSTOMER_ID = env('KOLLIQ_ESCROW_CUSTOMER_ID', default='kolliq-escrow')
+KOLLIQ_PLATFORM_CUSTOMER_ID = env('KOLLIQ_PLATFORM_CUSTOMER_ID', default='kolliq-platform')
+SQUAD_BENEFICIARY_ACCOUNT = env('SQUAD_BENEFICIARY_ACCOUNT', default='')
 
 # ── Demo Float for simulated loans/insurance disbursements ──────────────────
 DEMO_FLOAT_WALLET_ID = env.int('DEMO_FLOAT_WALLET_ID', default=2)
-DEMO_FLOAT_INITIAL_BALANCE = env.int('DEMO_FLOAT_INITIAL_BALANCE', default=500000)
+DEMO_FLOAT_INITIAL_BALANCE = env.int('DEMO_FLOAT_INITIAL_BALANCE', default=1000000)
 
 # ── Financial Services Config ───────────────────────────────────────────────
 LOAN_SCORE_THRESHOLD = env.int('LOAN_SCORE_THRESHOLD', default=50)
@@ -251,3 +302,12 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': crontab(minute=30),  # offset from main fraud sweep
     },
 }
+
+CSRF_TRUSTED_ORIGINS = env.list(
+    'CORS_ALLOWED_ORIGINS',
+    default=[
+        'http://localhost:8040',
+        'http://localhost:3000',
+        'https://*.ngrok-free.dev',
+    ]
+)
