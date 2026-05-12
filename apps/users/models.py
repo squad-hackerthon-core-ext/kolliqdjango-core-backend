@@ -61,6 +61,7 @@ class User(AbstractBaseUser):
     #  Profile
     # ------------------------------------------------------------------ #
     full_name = models.CharField(max_length=255, blank=True, default='')
+    middle_name = models.CharField(max_length=255, blank=True, default='')
     email = models.EmailField(blank=True, null=True)
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.WORKER)
     gender = models.CharField(max_length=1, choices=Gender.choices, blank=True, null=True)

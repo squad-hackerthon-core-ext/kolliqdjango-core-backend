@@ -2,12 +2,14 @@ import logging
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated , AllowAny
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 from django.db import transaction
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
+from drf_spectacular.types import OpenApiTypes
 
 from apps.users.models import User
 from apps.users.serializers import UserSerializer, UserCreateSerializer, LoginSerializer
@@ -27,8 +29,62 @@ def get_tokens_for_user(user):
 
 
 class UserCreateView(APIView):
+    permission_classes = [AllowAny]  # Allow anyone to create an account
     """Create a new user with SQUAD virtual account creation."""
 
+    @extend_schema(
+        operation_id='users_create',
+        summary='Create new user',
+        description='Create a new user account with optional SQUAD virtual account provisioning.',
+        request=UserCreateSerializer,
+        responses={
+            201: OpenApiExample(
+                'User Created',
+                value={
+                    'code': 201,
+                    'success': True,
+                    'message': 'User created successfully',
+                    'data': {
+                        'tokens': {
+                            'access': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
+                            'refresh': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
+                        },
+                        'user': {
+                            'id': '550e8400-e29b-41d4-a716-446655440000',
+                            'phone': '+2348012345678',
+                            'full_name': 'John Doe',
+                            'role': 'worker'
+                        }
+                    }
+                }
+            ),
+            200: OpenApiExample(
+                'User Exists',
+                value={
+                    'code': 200,
+                    'success': True,
+                    'message': 'User already exists',
+                    'data': {
+                        'id': '550e8400-e29b-41d4-a716-446655440000',
+                        'phone': '+2348012345678',
+                        'full_name': 'John Doe'
+                    }
+                }
+            ),
+            400: OpenApiExample(
+                'Validation Error',
+                value={
+                    'code': 400,
+                    'success': False,
+                    'message': 'Validation error',
+                    'errors': {
+                        'phone': ['This field is required.']
+                    }
+                }
+            )
+        },
+        tags=['Users']
+    )
     def post(self, request, *args, **kwargs):
         serializer = UserCreateSerializer(data=request.data)
 
@@ -157,8 +213,54 @@ class UserCreateView(APIView):
 
 
 class LoginView(APIView):
+    permission_classes = [AllowAny]  # Allow anyone to attempt login
     """Authenticate a user by phone + PIN. Returns JWT access & refresh tokens."""
 
+    @extend_schema(
+        operation_id='users_login',
+        summary='User login',
+        description='Authenticate user with phone number and PIN. Returns JWT access and refresh tokens.',
+        request=LoginSerializer,
+        responses={
+            200: OpenApiExample(
+                'Login Successful',
+                value={
+                    'code': 200,
+                    'success': True,
+                    'message': 'Login successful',
+                    'data': {
+                        'tokens': {
+                            'access': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
+                            'refresh': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
+                        },
+                        'user': {
+                            'id': '550e8400-e29b-41d4-a716-446655440000',
+                            'phone': '+2348012345678',
+                            'full_name': 'John Doe',
+                            'role': 'worker'
+                        }
+                    }
+                }
+            ),
+            401: OpenApiExample(
+                'Invalid PIN',
+                value={
+                    'code': 401,
+                    'success': False,
+                    'message': 'Invalid PIN'
+                }
+            ),
+            404: OpenApiExample(
+                'User Not Found',
+                value={
+                    'code': 404,
+                    'success': False,
+                    'message': 'No account found with this phone number'
+                }
+            )
+        },
+        tags=['Users']
+    )
     def post(self, request, *args, **kwargs):
         serializer = LoginSerializer(data=request.data)
 
@@ -221,7 +323,37 @@ class TokenRefreshView(APIView):
     Exchange a valid refresh token for a new access token.
     Body: { "refresh": "<refresh_token>" }
     """
+    permission_classes = [AllowAny]  # Allow anyone to refresh their token
 
+    @extend_schema(
+        operation_id='users_token_refresh',
+        summary='Refresh access token',
+        description='Exchange a valid refresh token for a new access token.',
+        request=OpenApiTypes.OBJECT,
+        responses={
+            200: OpenApiExample(
+                'Token Refreshed',
+                value={
+                    'code': 200,
+                    'success': True,
+                    'message': 'Token refreshed successfully',
+                    'data': {
+                        'access': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
+                        'refresh': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
+                    }
+                }
+            ),
+            401: OpenApiExample(
+                'Invalid Token',
+                value={
+                    'code': 401,
+                    'success': False,
+                    'message': 'Invalid or expired refresh token'
+                }
+            )
+        },
+        tags=['Users']
+    )
     def post(self, request, *args, **kwargs):
         refresh_token = request.data.get('refresh')
 
@@ -261,6 +393,39 @@ class LogoutView(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        operation_id='users_logout',
+        summary='User logout',
+        description='Logout user by blacklisting their refresh token. Requires authentication.',
+        request=OpenApiTypes.OBJECT,
+        responses={
+            200: OpenApiExample(
+                'Logout Successful',
+                value={
+                    'code': 200,
+                    'success': True,
+                    'message': 'Logged out successfully'
+                }
+            ),
+            400: OpenApiExample(
+                'Missing Token',
+                value={
+                    'code': 400,
+                    'success': False,
+                    'message': 'Refresh token is required to logout'
+                }
+            ),
+            401: OpenApiExample(
+                'Invalid Token',
+                value={
+                    'code': 401,
+                    'success': False,
+                    'message': 'Invalid or expired refresh token'
+                }
+            )
+        },
+        tags=['Users']
+    )
     def post(self, request, *args, **kwargs):
         refresh_token = request.data.get('refresh')
 
@@ -291,8 +456,74 @@ class LogoutView(APIView):
 
 
 class UserDetailView(APIView):
+    permission_classes = [AllowAny]
     """Get user details by phone number or user ID."""
 
+    @extend_schema(
+        operation_id='users_detail',
+        summary='Get user details',
+        description='Retrieve user details by user ID or phone number.',
+        parameters=[
+            OpenApiParameter(
+                name='user_id',
+                location=OpenApiParameter.PATH,
+                description='User UUID',
+                required=False,
+                type=OpenApiTypes.UUID,
+                examples=[
+                    OpenApiExample(
+                        'User ID',
+                        value='550e8400-e29b-41d4-a716-446655440000'
+                    )
+                ]
+            ),
+            OpenApiParameter(
+                name='phone',
+                location=OpenApiParameter.QUERY,
+                description='User phone number in E.164 format',
+                required=False,
+                type=OpenApiTypes.STR,
+                examples=[
+                    OpenApiExample(
+                        'Phone Number',
+                        value='+2348012345678'
+                    )
+                ]
+            ),
+        ],
+        responses={
+            200: OpenApiExample(
+                'User Found',
+                value={
+                    'code': 200,
+                    'success': True,
+                    'data': {
+                        'id': '550e8400-e29b-41d4-a716-446655440000',
+                        'phone': '+2348012345678',
+                        'full_name': 'John Doe',
+                        'role': 'worker'
+                    }
+                }
+            ),
+            400: OpenApiExample(
+                'Missing Parameters',
+                value={
+                    'code': 400,
+                    'success': False,
+                    'message': 'Either user_id or phone is required'
+                }
+            ),
+            404: OpenApiExample(
+                'User Not Found',
+                value={
+                    'code': 404,
+                    'success': False,
+                    'message': 'User not found'
+                }
+            )
+        },
+        tags=['Users']
+    )
     def get(self, request, *args, **kwargs):
         user_id = kwargs.get('user_id')
         phone = request.query_params.get('phone')
@@ -332,8 +563,55 @@ class UserDetailView(APIView):
 
 
 class UserUpdateView(APIView):
+    permission_classes = [AllowAny]  # Allow anyone to update user information
     """Update user information."""
 
+    @extend_schema(
+        operation_id='users_update',
+        summary='Update user',
+        description='Update user profile information. Only authenticated user can update their own profile.',
+        parameters=[
+            OpenApiParameter(
+                name='user_id',
+                location=OpenApiParameter.PATH,
+                description='User UUID',
+                required=True,
+                type=OpenApiTypes.UUID,
+                examples=[
+                    OpenApiExample(
+                        'User ID',
+                        value='550e8400-e29b-41d4-a716-446655440000'
+                    )
+                ]
+            ),
+        ],
+        request=OpenApiTypes.OBJECT,
+        responses={
+            200: OpenApiExample(
+                'User Updated',
+                value={
+                    'code': 200,
+                    'success': True,
+                    'message': 'User updated successfully',
+                    'data': {
+                        'id': '550e8400-e29b-41d4-a716-446655440000',
+                        'phone': '+2348012345678',
+                        'full_name': 'Jane Doe',
+                        'location_area': 'Lekki'
+                    }
+                }
+            ),
+            404: OpenApiExample(
+                'User Not Found',
+                value={
+                    'code': 404,
+                    'success': False,
+                    'message': 'User not found'
+                }
+            )
+        },
+        tags=['Users']
+    )
     def patch(self, request, user_id, *args, **kwargs):
         try:
             user = User.objects.get(id=user_id)
@@ -376,8 +654,66 @@ class UserUpdateView(APIView):
 
 
 class UserProfileView(APIView):
+    permission_classes = [AllowAny]
     """Get complete user profile including wallet and stats."""
 
+    @extend_schema(
+        operation_id='users_profile',
+        summary='Get user profile',
+        description='Retrieve comprehensive user profile including wallet and activity statistics.',
+        parameters=[
+            OpenApiParameter(
+                name='user_id',
+                location=OpenApiParameter.PATH,
+                description='User UUID',
+                required=True,
+                type=OpenApiTypes.UUID,
+                examples=[
+                    OpenApiExample(
+                        'User ID',
+                        value='550e8400-e29b-41d4-a716-446655440000'
+                    )
+                ]
+            ),
+        ],
+        responses={
+            200: OpenApiExample(
+                'Profile Retrieved',
+                value={
+                    'code': 200,
+                    'success': True,
+                    'data': {
+                        'user': {
+                            'id': '550e8400-e29b-41d4-a716-446655440000',
+                            'phone': '+2348012345678',
+                            'full_name': 'John Doe',
+                            'role': 'worker'
+                        },
+                        'wallet': {
+                            'balance': '5000.00',
+                            'escrow_balance': '1000.00',
+                            'virtual_account_number': '0700123456789',
+                            'bank_name': 'GTBank'
+                        },
+                        'stats': {
+                            'total_jobs_posted': 5,
+                            'total_jobs_completed': 3,
+                            'active_contracts': 1
+                        }
+                    }
+                }
+            ),
+            404: OpenApiExample(
+                'User Not Found',
+                value={
+                    'code': 404,
+                    'success': False,
+                    'message': 'User not found'
+                }
+            )
+        },
+        tags=['Users']
+    )
     def get(self, request, user_id, *args, **kwargs):
         try:
             user = User.objects.get(id=user_id)
@@ -430,8 +766,48 @@ class UserProfileView(APIView):
 
 
 class OnboardingCompleteView(APIView):
+    permission_classes = [AllowAny]
     """Mark user onboarding as complete."""
 
+    @extend_schema(
+        operation_id='users_onboarding_complete',
+        summary='Complete onboarding',
+        description='Mark user onboarding as complete. Requires authentication.',
+        parameters=[
+            OpenApiParameter(
+                name='user_id',
+                location=OpenApiParameter.PATH,
+                description='User UUID',
+                required=True,
+                type=OpenApiTypes.UUID,
+                examples=[
+                    OpenApiExample(
+                        'User ID',
+                        value='550e8400-e29b-41d4-a716-446655440000'
+                    )
+                ]
+            ),
+        ],
+        responses={
+            200: OpenApiExample(
+                'Onboarding Completed',
+                value={
+                    'code': 200,
+                    'success': True,
+                    'message': 'Onboarding completed successfully'
+                }
+            ),
+            404: OpenApiExample(
+                'User Not Found',
+                value={
+                    'code': 404,
+                    'success': False,
+                    'message': 'User not found'
+                }
+            )
+        },
+        tags=['Users']
+    )
     def post(self, request, user_id, *args, **kwargs):
         try:
             user = User.objects.get(id=user_id)
@@ -460,6 +836,7 @@ class OnboardingCompleteView(APIView):
 
 
 class OnboardingStatusView(APIView):
+    permission_classes = [AllowAny]
     """Get onboarding status."""
 
     def get(self, request, user_id, *args, **kwargs):
@@ -492,6 +869,7 @@ class OnboardingStatusView(APIView):
 
 
 class UserVirtualAccountView(APIView):
+    permission_classes = [AllowAny]
     """Get or create SQUAD virtual account for user."""
 
     def get(self, request, user_id, *args, **kwargs):
