@@ -9,7 +9,7 @@ environ.Env.read_env(BASE_DIR / '.env')
 
 SECRET_KEY = env('SECRET_KEY')
 DEBUG = env('DEBUG')
-ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=['localhost','.ngrok-free.dev'])
+ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', default=['localhost','.ngrok-free.dev'])
 
 DJANGO_APPS = [
     'unfold',
