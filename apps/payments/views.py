@@ -79,7 +79,7 @@ class SquadWebhookView(APIView):
     def post(self, request):
         from services.squad import SquadService
 
-        signature = request.headers.get('x-squad-signature', '')
+        signature = request.headers.get('x-squad-encrypted-body', '')
 
         try:
             payload = json.loads(request.body)

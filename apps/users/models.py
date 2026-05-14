@@ -39,6 +39,7 @@ class User(AbstractBaseUser):
     # ------------------------------------------------------------------ #
     class Role(models.TextChoices):
         WORKER = 'worker', 'Worker'
+        TRADER = 'trader', 'Trader'
         EMPLOYER = 'employer', 'Employer'
         ADMIN = 'admin', 'Admin'
 

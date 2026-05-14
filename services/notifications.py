@@ -76,3 +76,13 @@ def notify_loan_disbursed(user_id: str, amount: str, repayment_date: str):
     except User.DoesNotExist:
         logger.error(f"notify_loan_disbursed: User {user_id} not found")
 
+@shared_task
+def notify_trader_payment_received(user_id, amount, balance, sender):
+    """
+    Send SMS notification to trader when payment is received.
+    """
+    from services.notifications import notify_trader_payment_received as sync_notify
+    
+    logger.info(f"Sending payment notification to user {user_id}")
+    
+    return sync_notify(user_id, amount, balance, sender)

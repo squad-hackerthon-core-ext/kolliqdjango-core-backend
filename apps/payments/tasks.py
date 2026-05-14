@@ -23,25 +23,38 @@ def process_squad_webhook(payload: dict):
     Routes Squad webhook events.
     Virtual account payments are the main event type we care about.
     """
+    from decimal import Decimal
+    from django.conf import settings
+    from apps.payments.escrow import match_escrow_payment_to_job
+    from apps.wallets.models import Wallet
+    from apps.payments.models import Transaction
+    
+    logger.info("=" * 60)
+    logger.info("Squad webhook received - Processing payment")
+    logger.info("=" * 60)
+    
+    # Squad sends payment data directly at the top level
+    # Check if this looks like a payment (has transaction_reference and virtual_account_number)
+    if payload.get('transaction_reference') and payload.get('virtual_account_number'):
+        logger.info("Direct payment payload detected - processing")
+        _handle_virtual_account_payment(payload)
+        return
+    
+    # Fallback: Try wrapped event format
     event_type = (payload.get('Event') or payload.get('event') or '').lower()
     data = payload.get('Body') or payload.get('data') or {}
-
-    logger.info(f"Squad webhook received: {event_type}")
-
+    
     if event_type in ('charge.success', 'virtual_account.payment', 'payment.success'):
         _handle_virtual_account_payment(data)
     elif event_type in ('transfer.success', 'payout.success'):
         _handle_transfer_success(data)
     else:
-        logger.info(f"Unhandled Squad event: {event_type} — payload: {payload}")
+        logger.warning(f"Unhandled Squad event type: {event_type}")
 
 
 def _handle_virtual_account_payment(data: dict):
     """
     A payment landed on one of our virtual accounts.
-    Could be:
-      A) Employer paying into KOLLIQ_ESCROW_VIRTUAL_ACCOUNT → match to job
-      B) Customer paying Amina's personal virtual account → credit her wallet
     """
     from decimal import Decimal
     from django.conf import settings
@@ -49,61 +62,83 @@ def _handle_virtual_account_payment(data: dict):
     from apps.wallets.models import Wallet
     from apps.payments.models import Transaction
 
-    virtual_account = (
-        data.get('virtual_account_number') or
-        data.get('account_number') or ''
-    )
-    amount_kobo = int(data.get('amount', 0) or data.get('transaction_amount', 0))
-    amount_naira = Decimal(str(amount_kobo)) / 100
-    narration = data.get('transaction_remarks') or data.get('narration') or ''
-    squad_ref = data.get('transaction_ref') or data.get('reference') or ''
-
-    # ── Case A: Payment to escrow system account ──────────────────────────
-    escrow_va = settings.KOLLIQ_ESCROW_VIRTUAL_ACCOUNT
-    if virtual_account == escrow_va or not virtual_account:
-        # Try to match by narration reference
+    logger.info("-" * 40)
+    logger.info("Processing payment")
+    logger.info("-" * 40)
+    
+    # Squad sends these fields directly in the payload
+    virtual_account = data.get('virtual_account_number') or data.get('account_number', '')
+    amount_str = data.get('principal_amount') or data.get('settled_amount') or data.get('amount', '0')
+    narration = data.get('remarks') or data.get('transaction_remarks') or data.get('narration', '')
+    squad_ref = data.get('transaction_reference') or data.get('transaction_ref') or data.get('reference', '')
+    sender_name = data.get('sender_name') or data.get('customer_name') or 'a customer'
+    
+    logger.info(f"Virtual account: {virtual_account}")
+    logger.info(f"Amount string: {amount_str}")
+    logger.info(f"Reference: {squad_ref}")
+    
+    # Parse amount - remove commas if any
+    try:
+        amount_naira = Decimal(str(amount_str).replace(',', ''))
+        logger.info(f"Parsed amount: ₦{amount_naira}")
+    except (TypeError, ValueError) as e:
+        logger.error(f"Failed to parse amount: {amount_str} - {e}")
+        return
+    
+    # Check if this is escrow account
+    escrow_va = getattr(settings, 'KOLLIQ_ESCROW_VIRTUAL_ACCOUNT', None)
+    logger.info(f"Escrow VA setting: {escrow_va}")
+    
+    if virtual_account == escrow_va:
+        logger.info("Payment to ESCROW account")
         matched = match_escrow_payment_to_job(narration, amount_naira, squad_ref)
         if not matched:
-            logger.warning(
-                f"Unmatched escrow payment: ₦{amount_naira} "
-                f"narration='{narration}' ref={squad_ref}"
-            )
+            logger.warning(f"Unmatched escrow payment: ₦{amount_naira}")
         return
-
-    # ── Case B: Payment to a user's personal virtual account (Amina) ─────
+    
+    # Find user's wallet
+    logger.info(f"Looking for wallet with account: {virtual_account}")
+    
     try:
         wallet = Wallet.objects.select_related('user').get(
             squad_account_number=virtual_account
         )
+        logger.info(f"✅ Found wallet for user: {wallet.user.phone if wallet.user else 'Unknown'}")
+        logger.info(f"💰 Current balance: ₦{wallet.balance}")
     except Wallet.DoesNotExist:
-        logger.warning(f"Payment to unknown virtual account: {virtual_account}")
+        logger.error(f"❌ Wallet not found for account: {virtual_account}")
         return
-
+    
+    # Credit the wallet
     wallet.credit(amount_naira)
-
-    Transaction.objects.create(
+    logger.info(f"💰 New balance: ₦{wallet.balance}")
+    
+    # Create transaction
+    transaction = Transaction.objects.create(
         user=wallet.user,
         transaction_type=Transaction.Type.CREDIT,
         amount=amount_naira,
         status=Transaction.Status.SUCCESS,
         squad_reference=squad_ref,
-        description=f"Payment received — {narration or 'via virtual account'}",
+        description=f"Payment received from {sender_name} — {narration[:100] if narration else 'via virtual account'}",
         metadata=data,
     )
-
-    # Score recalculation — builds Amina's transaction history
+    logger.info(f"✅ Transaction created: {transaction.id}")
+    
+    # Trigger score recalculation
     from apps.scoring.tasks import recalculate_score
     recalculate_score.delay(str(wallet.user_id))
-
-    # SMS confirmation to trader
+    
+    # Send SMS notification
     from services.notifications import notify_trader_payment_received
-    sender = data.get('sender_name') or data.get('customer_name') or 'a customer'
     notify_trader_payment_received.delay(
         str(wallet.user_id),
         str(amount_naira),
         str(wallet.balance),
-        sender,
+        sender_name,
     )
+    
+    logger.info(f"✅ Payment of ₦{amount_naira} successfully processed")
 
 
 def _handle_transfer_success(data: dict):
@@ -119,6 +154,7 @@ def _handle_transfer_success(data: dict):
                 loan.save(update_fields=['status', 'updated_at'])
         except Loan.DoesNotExist:
             pass
+
 
 
 DRIFT_ALERT_THRESHOLD = Decimal(
