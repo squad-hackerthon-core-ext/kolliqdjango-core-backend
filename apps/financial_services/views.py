@@ -1,11 +1,12 @@
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
-from drf_spectacular.utils import extend_schema
+from kolliq.permissions import IsAuthenticatedOrInternalSecret, resolve_user
+from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiExample
 from django.db import transaction as db_transaction
 from django.utils import timezone
 from django.conf import settings
 from decimal import Decimal
-from datetime import date, timedelta
+from datetime import timedelta
 import uuid
 import logging
 
@@ -21,6 +22,7 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 AUTO_APPROVE_THRESHOLD = Decimal('5000.00')
+BEARER_SECURITY = [{"bearerAuth": []}]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -28,17 +30,35 @@ AUTO_APPROVE_THRESHOLD = Decimal('5000.00')
 # ══════════════════════════════════════════════════════════════════
 
 class SavingsBalanceView(APIView):
-    """GET /api/financial/savings/"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='savings_balance',
         summary='Get savings balance',
-        description='Retrieve current savings balance and eligibility status',
+        description='Retrieve current savings balance and eligibility status. Requires minimum economic score.',
+        request=None,
+        responses={
+            200: OpenApiResponse(description='Savings balance and eligibility details.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
+        examples=[
+            OpenApiExample(
+                'Unlocked',
+                value={'unlocked': True, 'wallet_balance': '5000.00', 'savings': {'balance': '2000.00'}, 'annual_interest_rate': 10},
+                response_only=True,
+            ),
+            OpenApiExample(
+                'Locked',
+                value={'unlocked': False, 'score': 30, 'score_needed': 50, 'message': 'Complete more gigs to unlock savings.'},
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
     def get(self, request):
-        user = request.user
+        user, err = resolve_user(request)
+        if err:
+            return err
         try:
             score = user.economic_score.score
         except Exception:
@@ -64,18 +84,34 @@ class SavingsBalanceView(APIView):
 
 
 class SavingsDepositView(APIView):
-    """POST /api/financial/savings/deposit/"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='savings_deposit',
         summary='Deposit to savings',
-        description='Move funds from wallet to savings',
+        description='Move funds from wallet to savings pot. Requires minimum economic score.',
         request=SavingsDepositSerializer,
+        responses={
+            200: OpenApiResponse(description='Deposit successful.'),
+            400: OpenApiResponse(description='Insufficient wallet balance or validation error.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            403: OpenApiResponse(description='Economic score too low.'),
+        },
+        examples=[
+            OpenApiExample('Request', value={'amount': '1000.00'}, request_only=True),
+            OpenApiExample(
+                'Response',
+                value={'deposited': '1000.00', 'savings_balance': '3000.00', 'wallet_balance': '4000.00'},
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
     def post(self, request):
-        user = request.user
+        user, err = resolve_user(request)
+        if err:
+            return err
+
         serializer = SavingsDepositSerializer(data=request.data)
         if not serializer.is_valid():
             return error_response(serializer.errors)
@@ -89,8 +125,7 @@ class SavingsDepositView(APIView):
 
         if score < settings.SAVINGS_SCORE_THRESHOLD:
             return error_response(
-                f'Savings unlocks at score {settings.SAVINGS_SCORE_THRESHOLD}. '
-                f'Your score: {score}.',
+                f'Savings unlocks at score {settings.SAVINGS_SCORE_THRESHOLD}. Your score: {score}.',
                 status=403
             )
 
@@ -124,18 +159,34 @@ class SavingsDepositView(APIView):
 
 
 class SavingsWithdrawView(APIView):
-    """POST /api/financial/savings/withdraw/"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='savings_withdraw',
         summary='Withdraw from savings',
-        description='Transfer funds from savings to wallet',
+        description='Transfer funds from savings pot to wallet. Pot must exist with sufficient balance.',
         request=SavingsWithdrawSerializer,
+        responses={
+            200: OpenApiResponse(description='Withdrawal successful.'),
+            400: OpenApiResponse(description='Insufficient savings balance or validation error.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            404: OpenApiResponse(description='No savings pot found.'),
+        },
+        examples=[
+            OpenApiExample('Request', value={'amount': '500.00'}, request_only=True),
+            OpenApiExample(
+                'Response',
+                value={'withdrawn': '500.00', 'savings_balance': '1500.00', 'wallet_balance': '5500.00'},
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
     def post(self, request):
-        user = request.user
+        user, err = resolve_user(request)
+        if err:
+            return err
+
         serializer = SavingsWithdrawSerializer(data=request.data)
         if not serializer.is_valid():
             return error_response(serializer.errors)
@@ -149,10 +200,7 @@ class SavingsWithdrawView(APIView):
                 return error_response('No savings pot found.', status=404)
 
             if pot.balance < amount:
-                return error_response(
-                    f'Insufficient savings. Balance: ₦{pot.balance}',
-                    status=400
-                )
+                return error_response(f'Insufficient savings. Balance: ₦{pot.balance}', status=400)
 
             pot.balance -= amount
             pot.save(update_fields=['balance', 'updated_at'])
@@ -189,7 +237,6 @@ def _get_max_loan_amount(score: int) -> Decimal:
 
 
 def _build_repayment_schedule(principal: Decimal, total: Decimal, disbursed_date) -> list:
-    """4 weekly installments."""
     weekly = (total / 4).quantize(Decimal('0.01'))
     schedule = []
     for i in range(1, 5):
@@ -205,24 +252,41 @@ def _build_repayment_schedule(principal: Decimal, total: Decimal, disbursed_date
 
 
 class LoanEligibilityView(APIView):
-    """GET /api/financial/loans/eligibility/"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='loan_eligibility',
         summary='Check loan eligibility',
-        description='Check if eligible for loans and max loan amount',
+        description='Check if eligible for a loan and what the maximum loan amount is based on economic score.',
+        request=None,
+        responses={
+            200: OpenApiResponse(description='Eligibility details.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
+        examples=[
+            OpenApiExample(
+                'Eligible',
+                value={'eligible': True, 'score': 75, 'max_amount': '50000', 'interest_rate': 5, 'tenure_days': 28},
+                response_only=True,
+            ),
+            OpenApiExample(
+                'Has active loan',
+                value={'eligible': False, 'reason': 'You have an active loan. Repay it first.', 'max_amount': '0'},
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
     def get(self, request):
-        user = request.user
+        user, err = resolve_user(request)
+        if err:
+            return err
 
         try:
             score = user.economic_score.score
         except Exception:
             score = 0
 
-        # Check for active loan
         has_active_loan = user.loans.filter(
             status__in=['pending', 'active', 'partially_repaid']
         ).exists()
@@ -254,8 +318,7 @@ class LoanEligibilityView(APIView):
             'financial_partner_mode': settings.FINANCIAL_PARTNER_MODE,
             'note': (
                 'Pre-qualified based on your verified economic activity. '
-                'Funds disbursed from Kolliq demo float. '
-                'A microfinance partner will provide capital at scale.'
+                'Funds disbursed from Kolliq demo float.'
             ) if eligible else '',
             'reason': (
                 f'Score too low. Need {settings.LOAN_SCORE_THRESHOLD}, have {score}.'
@@ -264,19 +327,44 @@ class LoanEligibilityView(APIView):
 
 
 class LoanApplyView(APIView):
-    """POST /api/financial/loans/apply/"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='loan_apply',
         summary='Apply for loan',
-        description='Submit loan application and receive disbursement',
+        description=(
+            'Submit a loan application. Funds are immediately disbursed to wallet if approved. '
+            'Repayment split into 4 weekly installments. User must not have an existing active loan.'
+        ),
         request=LoanApplySerializer,
+        responses={
+            201: OpenApiResponse(description='Loan approved and disbursed.'),
+            400: OpenApiResponse(description='Amount exceeds limit or validation error.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            403: OpenApiResponse(description='Economic score too low.'),
+            503: OpenApiResponse(description='Loan facility temporarily unavailable.'),
+        },
+        examples=[
+            OpenApiExample('Request', value={'amount': '10000.00'}, request_only=True),
+            OpenApiExample(
+                'Response',
+                value={
+                    'loan_id': 'abc123',
+                    'amount_disbursed': '10000.00',
+                    'total_repayable': '10500.00',
+                    'repayment_schedule': [{'week': 1, 'due_date': '2026-05-20', 'amount': '2625.00', 'paid': False}],
+                    'wallet_balance': '10000.00',
+                },
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
-    def post(self, request):
-        user = request.user
-        serializer = LoanApplySerializer(data=request.data, context={'request': request})
+    def get(self, request):
+        user, err = resolve_user(request)
+        if err:
+            return err
+        serializer = LoanApplySerializer(data=request.data, context={'request': request, 'user': user})
         if not serializer.is_valid():
             return error_response(serializer.errors)
 
@@ -290,40 +378,26 @@ class LoanApplyView(APIView):
         max_amount = _get_max_loan_amount(score)
 
         if score < settings.LOAN_SCORE_THRESHOLD:
-            return error_response(
-                f'Score too low. Need {settings.LOAN_SCORE_THRESHOLD}, have {score}.',
-                status=403
-            )
+            return error_response(f'Score too low. Need {settings.LOAN_SCORE_THRESHOLD}, have {score}.', status=403)
 
         if amount > max_amount:
-            return error_response(
-                f'Amount exceeds your limit of ₦{max_amount}. '
-                f'Complete more gigs to increase your limit.',
-                status=400
-            )
+            return error_response(f'Amount exceeds your limit of ₦{max_amount}.', status=400)
 
         interest_rate = Decimal(str(settings.LOAN_INTEREST_RATE_MONTHLY)) / 100
         total_repayable = (amount * (1 + interest_rate)).quantize(Decimal('0.01'))
         now = timezone.now()
 
         with db_transaction.atomic():
-            # Debit demo float
             try:
                 demo_float = DemoFloat.objects.select_for_update().get(id=1)
             except DemoFloat.DoesNotExist:
-                return error_response(
-                    'Loan facility temporarily unavailable. Try again shortly.',
-                    status=503
-                )
+                return error_response('Loan facility temporarily unavailable. Try again shortly.', status=503)
 
             try:
                 demo_float.disburse(amount)
             except ValueError as e:
                 logger.error(f"Demo float insufficient for loan: {e}")
-                return error_response(
-                    'Loan facility at capacity. Please try again tomorrow.',
-                    status=503
-                )
+                return error_response('Loan facility at capacity. Please try again tomorrow.', status=503)
 
             schedule = _build_repayment_schedule(amount, total_repayable, now.date())
 
@@ -340,10 +414,8 @@ class LoanApplyView(APIView):
                 squad_disbursement_ref=f"loan-disburse-{uuid.uuid4().hex[:12]}",
             )
 
-            # Credit user wallet
             user.wallet.credit(amount)
 
-            # Record transaction
             from apps.payments.models import Transaction
             Transaction.objects.create(
                 user=user,
@@ -351,17 +423,11 @@ class LoanApplyView(APIView):
                 amount=amount,
                 status=Transaction.Status.SUCCESS,
                 description=f'Loan disbursed — ₦{amount} at {settings.LOAN_INTEREST_RATE_MONTHLY}%/month',
-                metadata={
-                    'loan_id': str(loan.id),
-                    'source': 'demo_float',
-                    'total_repayable': str(total_repayable),
-                }
+                metadata={'loan_id': str(loan.id), 'source': 'demo_float', 'total_repayable': str(total_repayable)},
             )
 
-        # Async notifications
         from services.notifications import notify_loan_disbursed
-        first_due = schedule[0]['due_date']
-        notify_loan_disbursed.delay(str(user.id), str(amount), first_due)
+        notify_loan_disbursed.delay(str(user.id), str(amount), schedule[0]['due_date'])
 
         from apps.scoring.tasks import recalculate_score
         recalculate_score.delay(str(user.id))
@@ -374,26 +440,38 @@ class LoanApplyView(APIView):
             'repayment_schedule': schedule,
             'wallet_balance': str(user.wallet.balance),
             'funding_source': 'demo_float',
-            'message': (
-                f'₦{amount} disbursed to your wallet. '
-                f'Total to repay: ₦{total_repayable} in 4 weekly installments.'
-            ),
+            'message': f'₦{amount} disbursed to your wallet. Total to repay: ₦{total_repayable} in 4 weekly installments.',
         }, status=201)
 
 
 class LoanRepayView(APIView):
-    """POST /api/financial/loans/repay/"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='loan_repay',
         summary='Repay loan',
-        description='Make loan repayment',
+        description='Make a repayment against an active or partially repaid loan. Overpayments capped at outstanding balance.',
         request=LoanRepaySerializer,
+        responses={
+            200: OpenApiResponse(description='Repayment recorded.'),
+            400: OpenApiResponse(description='Loan not active or insufficient wallet balance.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            404: OpenApiResponse(description='Loan not found.'),
+        },
+        examples=[
+            OpenApiExample('Request', value={'loan_id': 'abc123', 'amount': '2625.00'}, request_only=True),
+            OpenApiExample(
+                'Response',
+                value={'repaid': '2625.00', 'outstanding_balance': '7875.00', 'loan_status': 'partially_repaid', 'wallet_balance': '2375.00'},
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
-    def post(self, request):
-        user = request.user
+    def get(self, request):
+        user, err = resolve_user(request)
+        if err:
+            return err
         serializer = LoanRepaySerializer(data=request.data)
         if not serializer.is_valid():
             return error_response(serializer.errors)
@@ -410,23 +488,20 @@ class LoanRepayView(APIView):
             return error_response(f'Loan is not active (status: {loan.status}).', status=400)
 
         if amount > loan.outstanding_balance:
-            amount = loan.outstanding_balance  # Accept over-payment gracefully
+            amount = loan.outstanding_balance
 
         with db_transaction.atomic():
-            # Debit user wallet
             try:
                 user.wallet.debit(amount)
             except ValueError as e:
                 return error_response(str(e), status=400)
 
-            # Update loan
             loan.amount_repaid += amount
             if loan.amount_repaid >= loan.total_repayable:
                 loan.status = Loan.Status.REPAID
             else:
                 loan.status = Loan.Status.PARTIALLY_REPAID
 
-            # Mark installments paid in schedule
             remaining = amount
             for installment in loan.repayment_schedule:
                 if not installment['paid'] and remaining > 0:
@@ -436,20 +511,17 @@ class LoanRepayView(APIView):
                         installment['paid_at'] = timezone.now().isoformat()
                         remaining -= inst_amount
                     else:
-                        # Partial installment payment — mark partial
                         installment['partial_paid'] = str(remaining)
                         remaining = Decimal('0')
 
             loan.save(update_fields=['amount_repaid', 'status', 'repayment_schedule', 'updated_at'])
 
-            # Return to demo float
             try:
                 demo_float = DemoFloat.objects.select_for_update().get(id=1)
                 demo_float.receive_repayment(amount)
             except DemoFloat.DoesNotExist:
                 pass
 
-            # Transaction record
             from apps.payments.models import Transaction
             Transaction.objects.create(
                 user=user,
@@ -460,7 +532,6 @@ class LoanRepayView(APIView):
                 metadata={'loan_id': str(loan.id), 'source': 'demo_float'},
             )
 
-        # Score recalculation — repayment is a positive score event
         from apps.scoring.tasks import recalculate_score
         recalculate_score.delay(str(user.id))
 
@@ -478,16 +549,30 @@ class LoanRepayView(APIView):
 
 
 class LoanListView(APIView):
-    """GET /api/financial/loans/"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='loans_list',
         summary='List loans',
-        description='Get all loans for current user',
+        description='Get all loans for the authenticated user, most recent first.',
+        request=None,
+        responses={
+            200: OpenApiResponse(response=LoanSerializer, description='List of all loans.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
+        examples=[
+            OpenApiExample(
+                'Response',
+                value={'loans': [{'id': 'abc123', 'amount': '10000.00', 'status': 'partially_repaid'}], 'count': 1},
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
     def get(self, request):
+        user, err = resolve_user(request)
+        if err:
+            return err
         loans = request.user.loans.all().order_by('-created_at')
         return success_response({
             'loans': LoanSerializer(loans, many=True).data,
@@ -500,13 +585,30 @@ class LoanListView(APIView):
 # ══════════════════════════════════════════════════════════════════
 
 class InsuranceActivateView(APIView):
-    """POST /api/financial/insurance/activate/"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='insurance_activate',
         summary='Activate insurance',
-        description='Activate insurance policy',
+        description=(
+            'Activate a daily premium insurance policy. Requires minimum economic score. '
+            'First day premium deducted immediately. Returns existing policy if already active.'
+        ),
+        request=None,
+        responses={
+            201: OpenApiResponse(description='Insurance policy activated.'),
+            200: OpenApiResponse(description='Policy already active.'),
+            400: OpenApiResponse(description='Insufficient wallet balance.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            403: OpenApiResponse(description='Economic score too low.'),
+        },
+        examples=[
+            OpenApiExample(
+                'Response',
+                value={'policy_id': 'pol123', 'daily_premium': '50.00', 'coverage_limit': '50000.00', 'status': 'active'},
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
     def post(self, request):
@@ -519,12 +621,10 @@ class InsuranceActivateView(APIView):
 
         if score < settings.INSURANCE_SCORE_THRESHOLD:
             return error_response(
-                f'Insurance unlocks at score {settings.INSURANCE_SCORE_THRESHOLD}. '
-                f'Your score: {score}.',
+                f'Insurance unlocks at score {settings.INSURANCE_SCORE_THRESHOLD}. Your score: {score}.',
                 status=403
             )
 
-        # Check no active policy
         active = user.insurance_policies.filter(status='active').first()
         if active:
             return success_response({
@@ -535,7 +635,6 @@ class InsuranceActivateView(APIView):
 
         daily_premium = Decimal(str(settings.INSURANCE_DAILY_PREMIUM))
 
-        # Check wallet can afford first premium
         try:
             wallet_balance = user.wallet.balance
         except Exception:
@@ -543,13 +642,11 @@ class InsuranceActivateView(APIView):
 
         if wallet_balance < daily_premium:
             return error_response(
-                f'Insufficient wallet balance for first premium. '
-                f'Need ₦{daily_premium}, have ₦{wallet_balance}.',
+                f'Insufficient wallet balance for first premium. Need ₦{daily_premium}, have ₦{wallet_balance}.',
                 status=400
             )
 
         with db_transaction.atomic():
-            # Deduct first day premium immediately
             user.wallet.debit(daily_premium)
 
             policy = InsurancePolicy.objects.create(
@@ -588,13 +685,24 @@ class InsuranceActivateView(APIView):
 
 
 class InsuranceStatusView(APIView):
-    """GET /api/financial/insurance/"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='insurance_status',
         summary='Get insurance status',
-        description='Get current insurance policy status',
+        description='Get current insurance status, active policy details, and full policy history.',
+        request=None,
+        responses={
+            200: OpenApiResponse(response=InsurancePolicySerializer, description='Insurance status and policies.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
+        examples=[
+            OpenApiExample(
+                'Response',
+                value={'has_active_policy': True, 'active_policy': {'id': 'pol123', 'status': 'active', 'days_active': 5}, 'all_policies': []},
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
     def get(self, request):
@@ -608,14 +716,28 @@ class InsuranceStatusView(APIView):
 
 
 class InsuranceClaimView(APIView):
-    """POST /api/financial/insurance/claim/"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='insurance_claim',
         summary='Submit insurance claim',
-        description='Submit claim for insurance payout',
+        description=(
+            'Submit a claim against an active policy. '
+            'Claims under ₦5,000 are auto-approved and paid immediately. '
+            'Larger claims go to manual review with payout within 24 hours. '
+            'Payout = (coverage_limit / 30) × days_missed, capped at coverage limit.'
+        ),
         request=InsuranceClaimCreateSerializer,
+        responses={
+            201: OpenApiResponse(description='Claim submitted — auto-approved or under review.'),
+            400: OpenApiResponse(description='No active policy or validation error.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
+        examples=[
+            OpenApiExample('Request', value={'days_missed': 3, 'reason': 'Illness prevented me from working'}, request_only=True),
+            OpenApiExample('Auto-approved', value={'claim_id': 'clm123', 'status': 'auto_approved', 'payout_amount': '5000.00'}, response_only=True),
+            OpenApiExample('Manual review', value={'claim_id': 'clm456', 'status': 'manual_review', 'payout_amount': '15000.00'}, response_only=True),
+        ],
         tags=['Financial Services'],
     )
     def post(self, request):
@@ -626,21 +748,14 @@ class InsuranceClaimView(APIView):
 
         active_policy = user.insurance_policies.filter(status='active').first()
         if not active_policy:
-            return error_response(
-                'No active insurance policy. Activate one first.',
-                status=400
-            )
+            return error_response('No active insurance policy. Activate one first.', status=400)
 
         days_missed = serializer.validated_data['days_missed']
         reason = serializer.validated_data['reason']
 
-        # Payout formula: (coverage_limit / 30) * days_missed
         daily_coverage = active_policy.coverage_limit / 30
         payout = (daily_coverage * days_missed).quantize(Decimal('0.01'))
-
-        # Cap at coverage limit
         payout = min(payout, active_policy.coverage_limit)
-
         auto_approve = payout <= AUTO_APPROVE_THRESHOLD
 
         with db_transaction.atomic():
@@ -659,7 +774,6 @@ class InsuranceClaimView(APIView):
             )
 
             if auto_approve:
-                # Disburse from demo float immediately
                 try:
                     demo_float = DemoFloat.objects.select_for_update().get(id=1)
                     demo_float.disburse(payout)
@@ -686,11 +800,7 @@ class InsuranceClaimView(APIView):
                     amount=payout,
                     status=Transaction.Status.SUCCESS,
                     description=f'Insurance claim auto-approved — {days_missed} days missed',
-                    metadata={
-                        'claim_id': str(claim.id),
-                        'source': 'demo_float',
-                        'days_missed': days_missed,
-                    },
+                    metadata={'claim_id': str(claim.id), 'source': 'demo_float', 'days_missed': days_missed},
                 )
 
         from apps.scoring.tasks import recalculate_score
@@ -709,21 +819,29 @@ class InsuranceClaimView(APIView):
             'claim_id': str(claim.id),
             'status': 'manual_review',
             'payout_amount': str(payout),
-            'message': (
-                f'Claim of ₦{payout} submitted for review. '
-                f'Payout within 24 hours if approved.'
-            ),
+            'message': f'Claim of ₦{payout} submitted for review. Payout within 24 hours if approved.',
         }, status=201)
 
 
 class ClaimListView(APIView):
-    """GET /api/financial/insurance/claims/"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='claims_list',
         summary='List insurance claims',
-        description='Get all insurance claims for current user',
+        description='Get all insurance claims for the authenticated user, most recent first.',
+        request=None,
+        responses={
+            200: OpenApiResponse(response=InsuranceClaimSerializer, description='List of all claims.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
+        examples=[
+            OpenApiExample(
+                'Response',
+                value={'claims': [{'id': 'clm123', 'days_missed': 3, 'payout_amount': '5000.00', 'status': 'auto_approved'}], 'count': 1},
+                response_only=True,
+            ),
+        ],
         tags=['Financial Services'],
     )
     def get(self, request):

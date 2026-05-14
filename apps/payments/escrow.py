@@ -238,6 +238,148 @@ def _release_escrow_simulated(job, worker, gross, net_to_worker, fee):
 
 def _release_escrow_live(job, worker, gross, net_to_worker, fee):
     """
+    Live escrow release: Squad Transfers API pays worker's real bank account.
+ 
+    Prerequisites:
+      - Worker must have bank_account_number + bank_code saved on their wallet
+        (via POST /api/wallets/bank-account/save/)
+      - FINANCIAL_PARTNER_MODE = 'live' in settings
+      - Squad secret key configured and transfer limits set
+ 
+    Flow:
+      merchant account (Squad) → worker's real bank account
+      fee stays in merchant account (tracked via Transaction record)
+    """
+    from services.squad import SquadService
+    from apps.payments.models import Transaction
+ 
+    squad     = SquadService()
+    reference = f"kolliq-payout-{job.id}-{worker.id}"[:100]
+ 
+    worker_wallet = worker.wallet
+ 
+    # ── Preflight: bank account must be saved and verified ────────────────────
+    if not worker_wallet.bank_account_number:
+        raise ValueError(
+            f"Worker {worker.id} ({worker.full_name}) has not saved a bank account. "
+            f"They must add their bank details before receiving payment."
+        )
+ 
+    if not worker_wallet.bank_account_verified:
+        raise ValueError(
+            f"Worker {worker.id} ({worker.full_name}) bank account is not verified. "
+            f"Ask them to re-save their bank details via the app."
+        )
+ 
+    if not worker_wallet.bank_code:
+        raise ValueError(
+            f"Worker {worker.id} ({worker.full_name}) bank code is missing."
+        )
+ 
+    # ── Initiate transfer: merchant account → worker's bank ───────────────────
+    logger.info(
+        f"Initiating live payout: job={job.id} worker={worker.id} "
+        f"amount=₦{net_to_worker} → {worker_wallet.bank_name} "
+        f"***{worker_wallet.bank_account_number[-4:]}"
+    )
+ 
+    try:
+        transfer_result = squad.initiate_transfer(
+            amount_kobo=int(net_to_worker * 100),       # Squad expects kobo
+            account_number=worker_wallet.bank_account_number,  # real bank acct
+            bank_code=worker_wallet.bank_code,           # real bank code (e.g. '058')
+            account_name=worker_wallet.bank_account_name or worker.full_name,
+            reference=reference,
+            narration=f"Kolliq payment: {job.title[:50]}",
+        )
+    except Exception as e:
+        logger.error(
+            f"Squad transfer failed: job={job.id} worker={worker.id} error={e}"
+        )
+        # Record failed transaction so we can retry/investigate
+        Transaction.objects.create(
+            user=worker,
+            transaction_type=Transaction.Type.CREDIT,
+            amount=net_to_worker,
+            status=Transaction.Status.FAILED,
+            job=job,
+            squad_reference=reference,
+            related_user=job.employer,
+            description=f"Payment FAILED for: {job.title}",
+            metadata={
+                'mode':          'live',
+                'error':         str(e),
+                'bank_code':     worker_wallet.bank_code,
+                'bank_name':     worker_wallet.bank_name,
+                'account_last4': worker_wallet.bank_account_number[-4:],
+            },
+        )
+        raise
+ 
+    # ── Determine transaction status from Squad response ──────────────────────
+    squad_status = transfer_result.get('status', '')
+    tx_status = (
+        Transaction.Status.SUCCESS
+        if squad_status in ('success', 'successful')
+        else Transaction.Status.PENDING   # Squad may process async
+    )
+ 
+    logger.info(
+        f"Squad transfer response: status={squad_status} reference={reference}"
+    )
+ 
+    # ── Worker credit record ──────────────────────────────────────────────────
+    Transaction.objects.create(
+        user=worker,
+        transaction_type=Transaction.Type.CREDIT,
+        amount=net_to_worker,
+        status=tx_status,
+        job=job,
+        squad_reference=reference,
+        related_user=job.employer,
+        description=f"Payment for: {job.title}",
+        metadata={
+            'mode':          'live',
+            'bank_name':     worker_wallet.bank_name,
+            'bank_code':     worker_wallet.bank_code,
+            'account_name':  worker_wallet.bank_account_name,
+            'account_last4': worker_wallet.bank_account_number[-4:],
+            'squad_response': transfer_result,
+        },
+    )
+ 
+    # ── Employer escrow release record ────────────────────────────────────────
+    Transaction.objects.create(
+        user=job.employer,
+        transaction_type=Transaction.Type.ESCROW_RELEASE,
+        amount=gross,
+        status=tx_status,
+        job=job,
+        squad_reference=reference,
+        related_user=worker,
+        description=f"Escrow released for: {job.title}",
+        metadata={
+            'mode':            'live',
+            'net_to_worker':   str(net_to_worker),
+            'platform_fee':    str(fee),
+        },
+    )
+ 
+    # ── Platform fee record (stays in merchant account) ───────────────────────
+    Transaction.objects.create(
+        user=job.employer,
+        transaction_type=Transaction.Type.PLATFORM_FEE,
+        amount=fee,
+        status=Transaction.Status.SUCCESS,
+        job=job,
+        description=f"Platform fee (5%) for: {job.title}",
+        metadata={
+            'mode': 'live',
+            'note': 'Fee retained in Squad merchant account',
+        },
+    )
+
+    """
     Live escrow release: Squad Transfers API moves money between virtual accounts.
     Activated when FINANCIAL_PARTNER_MODE = 'live'.
     """

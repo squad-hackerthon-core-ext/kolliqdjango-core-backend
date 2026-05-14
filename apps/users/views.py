@@ -1,960 +1,436 @@
 import logging
+
+from django.utils import timezone
+from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiExample
 from rest_framework import status
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated , AllowAny
-from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
-from django.db import transaction
-from django.utils import timezone
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
-from drf_spectacular.types import OpenApiTypes
 
-from apps.users.models import User
-from apps.users.serializers import UserSerializer, UserCreateSerializer, LoginSerializer
-from apps.wallets.models import Wallet
-from services.squad import SquadService, SquadAPIError
+from apps.users.models import User, PinResetOTP
+from apps.users.serializers import (
+    UserSerializer,
+    UserCreateSerializer,
+    LoginSerializer,
+    ChangePinSerializer,
+    ResetPinRequestSerializer,
+    ResetPinConfirmSerializer,
+)
+from services.africas_talking import ATService
 
 logger = logging.getLogger(__name__)
+_at = ATService()
+BEARER_SECURITY = [{"bearerAuth": []}]
 
 
-def get_tokens_for_user(user):
-    """Generate a JWT access + refresh token pair for the given user."""
+def _user_response(user, status_code=status.HTTP_200_OK):
     refresh = RefreshToken.for_user(user)
-    return {
-        'access': str(refresh.access_token),
-        'refresh': str(refresh),
-    }
+    return Response(
+        {
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+            "user": UserSerializer(user).data,
+        },
+        status=status_code,
+    )
 
 
-class UserCreateView(APIView):
-    permission_classes = [AllowAny]  # Allow anyone to create an account
-    """Create a new user with SQUAD virtual account creation."""
+def _send_otp_sms(phone: str, otp: str) -> None:
+    message = (
+        f"Your reset OTP is {otp}. "
+        "It expires in 10 minutes. Do not share it with anyone."
+    )
+    result = _at.send_sms(phone, message)
+    if not result.get("success"):
+        logger.error("ATService failed to deliver OTP to %s — provider response: %s", phone, result)
+        raise RuntimeError("SMS delivery failed")
+
+
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
 
     @extend_schema(
-        operation_id='users_create',
-        summary='Create new user',
-        description='Create a new user account with optional SQUAD virtual account provisioning.',
+        summary="Register a new user",
+        description=(
+            "Creates a new user account. Returns access + refresh JWT tokens "
+            "and the full user profile on success. "
+            "Returns 409 if the phone number is already registered."
+        ),
         request=UserCreateSerializer,
         responses={
-            201: OpenApiExample(
-                'User Created',
-                value={
-                    'code': 201,
-                    'success': True,
-                    'message': 'User created successfully',
-                    'data': {
-                        'tokens': {
-                            'access': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
-                            'refresh': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
-                        },
-                        'user': {
-                            'id': '550e8400-e29b-41d4-a716-446655440000',
-                            'phone': '+2348012345678',
-                            'full_name': 'John Doe',
-                            'role': 'worker'
-                        }
-                    }
-                }
-            ),
-            200: OpenApiExample(
-                'User Exists',
-                value={
-                    'code': 200,
-                    'success': True,
-                    'message': 'User already exists',
-                    'data': {
-                        'id': '550e8400-e29b-41d4-a716-446655440000',
-                        'phone': '+2348012345678',
-                        'full_name': 'John Doe'
-                    }
-                }
-            ),
-            400: OpenApiExample(
-                'Validation Error',
-                value={
-                    'code': 400,
-                    'success': False,
-                    'message': 'Validation error',
-                    'errors': {
-                        'phone': ['This field is required.']
-                    }
-                }
-            )
+            201: OpenApiResponse(response=UserSerializer, description="Account created."),
+            400: OpenApiResponse(description="Validation error."),
+            409: OpenApiResponse(description="Phone number already registered."),
         },
-        tags=['Users']
+        examples=[
+            OpenApiExample(
+                "Worker registration",
+                value={
+                    "phone": "+2348012345678",
+                    "pin": "123456",
+                    "full_name": "Amaka Obi",
+                    "role": "worker",
+                    "gender": "female",
+                    "location_city": "Lagos",
+                },
+                request_only=True,
+            ),
+        ],
+        tags=["Auth"],
     )
-    def post(self, request, *args, **kwargs):
+    def post(self, request):
         serializer = UserCreateSerializer(data=request.data)
-
         if not serializer.is_valid():
-            return Response({
-                'code': 400,
-                'success': False,
-                'message': 'Validation error',
-                'errors': serializer.errors
-            }, status=status.HTTP_400_BAD_REQUEST)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         data = serializer.validated_data
-        phone = data['phone']
+        phone = data["phone"]
 
-        existing_user = User.objects.filter(phone=phone).first()
+        if User.objects.filter(phone=phone).exists():
+            return Response(
+                {"detail": "An account with this phone number already exists."},
+                status=status.HTTP_409_CONFLICT,
+            )
 
-        if existing_user:
-            user_serializer = UserSerializer(existing_user)
-            return Response({
-                'code': 200,
-                'success': True,
-                'message': 'User already exists',
-                'data': user_serializer.data
-            }, status=status.HTTP_200_OK)
+        pin = data.pop("pin", None)
+        user = User(
+            phone=phone,
+            full_name=data.get("full_name", ""),
+            email=data.get("email"),
+            role=data.get("role", User.Role.WORKER),
+            gender=data.get("gender"),
+            date_of_birth=data.get("date_of_birth"),
+            address=data.get("address"),
+            location_area=data.get("location_area", ""),
+            location_city=data.get("location_city", "Lagos"),
+            skills=data.get("skills", []),
+            languages=data.get("languages", []),
+            has_vehicle=data.get("has_vehicle", False),
+            vehicle_type=data.get("vehicle_type", "none"),
+            availability=data.get("availability", User.Availability.FULL_DAY),
+            trade_category=data.get("trade_category", ""),
+            market_name=data.get("market_name", ""),
+            weekly_income_range=data.get("weekly_income_range", ""),
+            business_name=data.get("business_name", ""),
+            channel=data.get("channel", "app"),
+        )
 
-        try:
-            with transaction.atomic():
-                full_name = data.get('full_name', '')
-                name_parts = full_name.split(' ', 1)
-                first_name = name_parts[0] if name_parts else ''
-                last_name = name_parts[1] if len(name_parts) > 1 else ''
+        if data.get("bvn"):
+            user.bvn = data["bvn"]
+        if pin:
+            user.set_pin(pin)
+        user.save()
 
-                dob = ''
-                if data.get('date_of_birth'):
-                    dob = data['date_of_birth'].strftime('%m/%d/%Y')
-
-                gender = '1'
-                if data.get('gender') == 'F':
-                    gender = '2'
-                elif data.get('gender') == 'O':
-                    gender = '1'
-
-                user = User.objects.create(
-                    phone=phone,
-                    full_name=full_name,
-                    role=data.get('role', User.Role.WORKER),
-                    email=data.get('email'),
-                    date_of_birth=data.get('date_of_birth'),
-                    bvn=data.get('bvn'),
-                    gender=data.get('gender'),
-                    address=data.get('address'),
-                    location_area=data.get('location_area', ''),
-                    location_city=data.get('location_city', 'Lagos'),
-                    skills=data.get('skills', []),
-                    languages=data.get('languages', []),
-                    has_vehicle=data.get('has_vehicle', False),
-                    vehicle_type=data.get('vehicle_type', 'none'),
-                    availability=data.get('availability', User.Availability.FULL_DAY),
-                    trade_category=data.get('trade_category', ''),
-                    market_name=data.get('market_name', ''),
-                    weekly_income_range=data.get('weekly_income_range', ''),
-                    business_name=data.get('business_name', ''),
-                    channel=data.get('channel', 'app'),
-                    is_active=True,
-                    onboarding_complete=False,
-                )
-
-                if data.get('pin'):
-                    user.set_pin(data['pin'])
-                    user.save()
-
-                wallet = Wallet.objects.create(user=user, balance=0, escrow_balance=0)
-
-                try:
-                    squad_service = SquadService()
-                    squad_response = squad_service.create_virtual_account(
-                        customer_identifier=str(user.id),
-                        first_name=first_name or full_name[:50] or phone,
-                        last_name=last_name or 'User',
-                        middle_name='',
-                        phone=phone,
-                        email=data.get('email', f"{phone}@kolliq.ng"),
-                        dob=dob,
-                        bvn=data.get('bvn', ''),
-                        gender=gender,
-                        address=data.get('address', ''),
-                    )
-
-                    user.squad_account_number = squad_response.get('virtual_account_number')
-                    user.squad_bank_name = squad_response.get('bank_name', 'GTBank')
-                    user.squad_account_status = 'active'
-                    user.squad_account_created_at = timezone.now()
-                    user.save()
-
-                    wallet.virtual_account_number = squad_response.get('virtual_account_number')
-                    wallet.bank_code = squad_response.get('bank_code', '058')
-                    wallet.save()
-
-                    logger.info(f"Squad VA created for user {user.id}: {user.squad_account_number}")
-
-                except SquadAPIError as e:
-                    logger.error(f"Squad VA creation failed for user {user.id}: {str(e)}")
-                    user.squad_account_status = 'failed'
-                    user.save()
-
-                tokens = get_tokens_for_user(user)
-                user_serializer = UserSerializer(user)
-
-                return Response({
-                    'code': 201,
-                    'success': True,
-                    'message': 'User created successfully',
-                    'data': {
-                        'tokens': tokens,
-                        'user': user_serializer.data,
-                    }
-                }, status=status.HTTP_201_CREATED)
-
-        except Exception as e:
-            logger.error(f"Error creating user: {str(e)}", exc_info=True)
-            return Response({
-                'code': 500,
-                'success': False,
-                'message': 'Internal server error'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        logger.info("New user registered: %s (role=%s)", phone, user.role)
+        return _user_response(user, status_code=status.HTTP_201_CREATED)
 
 
 class LoginView(APIView):
-    permission_classes = [AllowAny]  # Allow anyone to attempt login
-    """Authenticate a user by phone + PIN. Returns JWT access & refresh tokens."""
+    permission_classes = [AllowAny]
 
     @extend_schema(
-        operation_id='users_login',
-        summary='User login',
-        description='Authenticate user with phone number and PIN. Returns JWT access and refresh tokens.',
+        summary="Login with phone + PIN",
+        description=(
+            "Authenticates a user with their phone number and PIN. "
+            "Returns access + refresh JWT tokens and the full user profile."
+        ),
         request=LoginSerializer,
         responses={
-            200: OpenApiExample(
-                'Login Successful',
-                value={
-                    'code': 200,
-                    'success': True,
-                    'message': 'Login successful',
-                    'data': {
-                        'tokens': {
-                            'access': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
-                            'refresh': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
-                        },
-                        'user': {
-                            'id': '550e8400-e29b-41d4-a716-446655440000',
-                            'phone': '+2348012345678',
-                            'full_name': 'John Doe',
-                            'role': 'worker'
-                        }
-                    }
-                }
-            ),
-            401: OpenApiExample(
-                'Invalid PIN',
-                value={
-                    'code': 401,
-                    'success': False,
-                    'message': 'Invalid PIN'
-                }
-            ),
-            404: OpenApiExample(
-                'User Not Found',
-                value={
-                    'code': 404,
-                    'success': False,
-                    'message': 'No account found with this phone number'
-                }
-            )
+            200: OpenApiResponse(response=UserSerializer, description="Login successful."),
+            400: OpenApiResponse(description="Validation error."),
+            401: OpenApiResponse(description="Invalid phone number or PIN."),
+            403: OpenApiResponse(description="Account is deactivated."),
         },
-        tags=['Users']
+        examples=[
+            OpenApiExample(
+                "Login example",
+                value={"phone": "+2347061003002", "pin": "1234"},
+                request_only=True,
+            ),
+        ],
+        tags=["Auth"],
     )
-    def post(self, request, *args, **kwargs):
+    def post(self, request):
         serializer = LoginSerializer(data=request.data)
-
         if not serializer.is_valid():
-            return Response({
-                'code': 400,
-                'success': False,
-                'message': 'Validation error',
-                'errors': serializer.errors
-            }, status=status.HTTP_400_BAD_REQUEST)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        phone = serializer.validated_data['phone']
-        pin = serializer.validated_data['pin']
+        phone = serializer.validated_data["phone"]
+        pin = serializer.validated_data["pin"]
 
         try:
             user = User.objects.get(phone=phone)
         except User.DoesNotExist:
-            return Response({
-                'code': 404,
-                'success': False,
-                'message': 'No account found with this phone number'
-            }, status=status.HTTP_404_NOT_FOUND)
+            return Response({"detail": "Invalid phone number or PIN."}, status=status.HTTP_401_UNAUTHORIZED)
 
         if not user.is_active:
-            return Response({
-                'code': 403,
-                'success': False,
-                'message': 'Your account has been deactivated. Please contact support.'
-            }, status=status.HTTP_403_FORBIDDEN)
+            return Response({"detail": "This account has been deactivated."}, status=status.HTTP_403_FORBIDDEN)
 
         if not user.check_pin(pin):
-            logger.warning(f"Failed login attempt for phone: {phone}")
-            return Response({
-                'code': 401,
-                'success': False,
-                'message': 'Invalid PIN'
-            }, status=status.HTTP_401_UNAUTHORIZED)
+            return Response({"detail": "Invalid phone number or PIN."}, status=status.HTTP_401_UNAUTHORIZED)
 
         user.last_login = timezone.now()
-        user.save(update_fields=['last_login'])
+        user.save(update_fields=["last_login"])
 
-        tokens = get_tokens_for_user(user)
-        user_serializer = UserSerializer(user)
-
-        logger.info(f"User {user.id} logged in successfully")
-
-        return Response({
-            'code': 200,
-            'success': True,
-            'message': 'Login successful',
-            'data': {
-                'tokens': tokens,
-                'user': user_serializer.data,
-            }
-        }, status=status.HTTP_200_OK)
-
-
-class TokenRefreshView(APIView):
-    """
-    Exchange a valid refresh token for a new access token.
-    Body: { "refresh": "<refresh_token>" }
-    """
-    permission_classes = [AllowAny]  # Allow anyone to refresh their token
-
-    @extend_schema(
-        operation_id='users_token_refresh',
-        summary='Refresh access token',
-        description='Exchange a valid refresh token for a new access token.',
-        request=OpenApiTypes.OBJECT,
-        responses={
-            200: OpenApiExample(
-                'Token Refreshed',
-                value={
-                    'code': 200,
-                    'success': True,
-                    'message': 'Token refreshed successfully',
-                    'data': {
-                        'access': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
-                        'refresh': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
-                    }
-                }
-            ),
-            401: OpenApiExample(
-                'Invalid Token',
-                value={
-                    'code': 401,
-                    'success': False,
-                    'message': 'Invalid or expired refresh token'
-                }
-            )
-        },
-        tags=['Users']
-    )
-    def post(self, request, *args, **kwargs):
-        refresh_token = request.data.get('refresh')
-
-        if not refresh_token:
-            return Response({
-                'code': 400,
-                'success': False,
-                'message': 'Refresh token is required'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            refresh = RefreshToken(refresh_token)
-            return Response({
-                'code': 200,
-                'success': True,
-                'message': 'Token refreshed successfully',
-                'data': {
-                    'access': str(refresh.access_token),
-                    'refresh': str(refresh),
-                }
-            }, status=status.HTTP_200_OK)
-
-        except TokenError:
-            return Response({
-                'code': 401,
-                'success': False,
-                'message': 'Invalid or expired refresh token'
-            }, status=status.HTTP_401_UNAUTHORIZED)
+        logger.info("User logged in: %s", phone)
+        return _user_response(user)
 
 
 class LogoutView(APIView):
-    """
-    Blacklist the refresh token, effectively logging the user out.
-    Body: { "refresh": "<refresh_token>" }
-    Header: Authorization: Bearer <access_token>
-    """
-    authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
-        operation_id='users_logout',
-        summary='User logout',
-        description='Logout user by blacklisting their refresh token. Requires authentication.',
-        request=OpenApiTypes.OBJECT,
+        summary="Logout",
+        description=(
+            "Blacklists the provided refresh token. "
+            "Send the refresh token in the request body."
+        ),
+        request=None,
         responses={
-            200: OpenApiExample(
-                'Logout Successful',
-                value={
-                    'code': 200,
-                    'success': True,
-                    'message': 'Logged out successfully'
-                }
-            ),
-            400: OpenApiExample(
-                'Missing Token',
-                value={
-                    'code': 400,
-                    'success': False,
-                    'message': 'Refresh token is required to logout'
-                }
-            ),
-            401: OpenApiExample(
-                'Invalid Token',
-                value={
-                    'code': 401,
-                    'success': False,
-                    'message': 'Invalid or expired refresh token'
-                }
-            )
+            200: OpenApiResponse(description="Logged out successfully."),
+            400: OpenApiResponse(description="Refresh token missing or invalid."),
+            401: OpenApiResponse(description="Not authenticated."),
         },
-        tags=['Users']
+        examples=[
+            OpenApiExample(
+                "Logout body",
+                value={"refresh": "<your_refresh_token>"},
+                request_only=True,
+            ),
+        ],
+        tags=["Auth"],
     )
-    def post(self, request, *args, **kwargs):
-        refresh_token = request.data.get('refresh')
-
+    def post(self, request):
+        refresh_token = request.data.get("refresh")
         if not refresh_token:
-            return Response({
-                'code': 400,
-                'success': False,
-                'message': 'Refresh token is required to logout'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
+            return Response({"detail": "Refresh token is required."}, status=status.HTTP_400_BAD_REQUEST)
         try:
             token = RefreshToken(refresh_token)
             token.blacklist()
-
-            logger.info(f"User {request.user.id} logged out successfully")
-            return Response({
-                'code': 200,
-                'success': True,
-                'message': 'Logged out successfully'
-            }, status=status.HTTP_200_OK)
-
         except TokenError:
-            return Response({
-                'code': 401,
-                'success': False,
-                'message': 'Invalid or expired refresh token'
-            }, status=status.HTTP_401_UNAUTHORIZED)
+            return Response({"detail": "Token is invalid or already blacklisted."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"detail": "Logged out successfully."}, status=status.HTTP_200_OK)
 
 
-class UserDetailView(APIView):
-    permission_classes = [AllowAny]
-    """Get user details by phone number or user ID."""
+class MeView(APIView):
+    permission_classes = [IsAuthenticated]
 
     @extend_schema(
-        operation_id='users_detail',
-        summary='Get user details',
-        description='Retrieve user details by user ID or phone number.',
-        parameters=[
-            OpenApiParameter(
-                name='user_id',
-                location=OpenApiParameter.PATH,
-                description='User UUID',
-                required=False,
-                type=OpenApiTypes.UUID,
-                examples=[
-                    OpenApiExample(
-                        'User ID',
-                        value='550e8400-e29b-41d4-a716-446655440000'
-                    )
-                ]
-            ),
-            OpenApiParameter(
-                name='phone',
-                location=OpenApiParameter.QUERY,
-                description='User phone number in E.164 format',
-                required=False,
-                type=OpenApiTypes.STR,
-                examples=[
-                    OpenApiExample(
-                        'Phone Number',
-                        value='+2348012345678'
-                    )
-                ]
+        summary="Get current user identity",
+        description="Returns id, phone, full_name, and role of the authenticated user.",
+        request=None,
+        responses={
+            200: OpenApiResponse(description="Current user identity."),
+            401: OpenApiResponse(description="Not authenticated."),
+        },
+        examples=[
+            OpenApiExample(
+                "Identity response",
+                value={"id": "b04f4f06-82b3-4b1c-8401-eef8aa0d5abf", "phone": "+2348012345678", "full_name": "Amaka Obi", "role": "worker"},
+                response_only=True,
             ),
         ],
-        responses={
-            200: OpenApiExample(
-                'User Found',
-                value={
-                    'code': 200,
-                    'success': True,
-                    'data': {
-                        'id': '550e8400-e29b-41d4-a716-446655440000',
-                        'phone': '+2348012345678',
-                        'full_name': 'John Doe',
-                        'role': 'worker'
-                    }
-                }
-            ),
-            400: OpenApiExample(
-                'Missing Parameters',
-                value={
-                    'code': 400,
-                    'success': False,
-                    'message': 'Either user_id or phone is required'
-                }
-            ),
-            404: OpenApiExample(
-                'User Not Found',
-                value={
-                    'code': 404,
-                    'success': False,
-                    'message': 'User not found'
-                }
-            )
-        },
-        tags=['Users']
+        tags=["Auth"],
     )
-    def get(self, request, *args, **kwargs):
-        user_id = kwargs.get('user_id')
-        phone = request.query_params.get('phone')
-
-        try:
-            if user_id:
-                user = User.objects.get(id=user_id)
-            elif phone:
-                user = User.objects.get(phone=phone)
-            else:
-                return Response({
-                    'code': 400,
-                    'success': False,
-                    'message': 'Either user_id or phone is required'
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            serializer = UserSerializer(user)
-            return Response({
-                'code': 200,
-                'success': True,
-                'data': serializer.data
-            }, status=status.HTTP_200_OK)
-
-        except User.DoesNotExist:
-            return Response({
-                'code': 404,
-                'success': False,
-                'message': 'User not found'
-            }, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error fetching user: {str(e)}")
-            return Response({
-                'code': 500,
-                'success': False,
-                'message': 'Internal server error'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    def get(self, request):
+        user = request.user
+        return Response(
+            {"id": user.id, "phone": user.phone, "full_name": user.full_name, "role": user.role},
+            status=status.HTTP_200_OK,
+        )
 
 
-class UserUpdateView(APIView):
-    permission_classes = [AllowAny]  # Allow anyone to update user information
-    """Update user information."""
+class ProfileView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    UPDATABLE_FIELDS = [
+        "full_name", "email", "gender", "date_of_birth",
+        "address", "location_area", "location_city",
+        "location_lat", "location_lng", "skills", "languages",
+        "has_vehicle", "vehicle_type", "availability",
+        "trade_category", "market_name", "weekly_income_range", "business_name",
+    ]
 
     @extend_schema(
-        operation_id='users_update',
-        summary='Update user',
-        description='Update user profile information. Only authenticated user can update their own profile.',
-        parameters=[
-            OpenApiParameter(
-                name='user_id',
-                location=OpenApiParameter.PATH,
-                description='User UUID',
-                required=True,
-                type=OpenApiTypes.UUID,
-                examples=[
-                    OpenApiExample(
-                        'User ID',
-                        value='550e8400-e29b-41d4-a716-446655440000'
-                    )
-                ]
-            ),
-        ],
-        request=OpenApiTypes.OBJECT,
+        summary="Get full user profile",
+        description="Returns the complete profile of the authenticated user.",
+        request=None,
         responses={
-            200: OpenApiExample(
-                'User Updated',
-                value={
-                    'code': 200,
-                    'success': True,
-                    'message': 'User updated successfully',
-                    'data': {
-                        'id': '550e8400-e29b-41d4-a716-446655440000',
-                        'phone': '+2348012345678',
-                        'full_name': 'Jane Doe',
-                        'location_area': 'Lekki'
-                    }
-                }
-            ),
-            404: OpenApiExample(
-                'User Not Found',
-                value={
-                    'code': 404,
-                    'success': False,
-                    'message': 'User not found'
-                }
-            )
+            200: OpenApiResponse(response=UserSerializer, description="Full user profile."),
+            401: OpenApiResponse(description="Not authenticated."),
         },
-        tags=['Users']
+        tags=["Profile"],
     )
-    def patch(self, request, user_id, *args, **kwargs):
-        try:
-            user = User.objects.get(id=user_id)
-
-            allowed_fields = [
-                'full_name', 'location_area', 'location_city', 'location_lat', 'location_lng',
-                'skills', 'languages', 'has_vehicle', 'vehicle_type', 'availability',
-                'trade_category', 'market_name', 'weekly_income_range', 'business_name',
-                'email', 'date_of_birth', 'bvn', 'gender', 'address',
-                'onboarding_complete', 'is_verified'
-            ]
-
-            for field in allowed_fields:
-                if field in request.data:
-                    setattr(user, field, request.data[field])
-
-            user.save()
-
-            serializer = UserSerializer(user)
-            return Response({
-                'code': 200,
-                'success': True,
-                'message': 'User updated successfully',
-                'data': serializer.data
-            }, status=status.HTTP_200_OK)
-
-        except User.DoesNotExist:
-            return Response({
-                'code': 404,
-                'success': False,
-                'message': 'User not found'
-            }, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error updating user: {str(e)}")
-            return Response({
-                'code': 500,
-                'success': False,
-                'message': 'Internal server error'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class UserProfileView(APIView):
-    permission_classes = [AllowAny]
-    """Get complete user profile including wallet and stats."""
+    def get(self, request):
+        return Response(UserSerializer(request.user).data)
 
     @extend_schema(
-        operation_id='users_profile',
-        summary='Get user profile',
-        description='Retrieve comprehensive user profile including wallet and activity statistics.',
-        parameters=[
-            OpenApiParameter(
-                name='user_id',
-                location=OpenApiParameter.PATH,
-                description='User UUID',
-                required=True,
-                type=OpenApiTypes.UUID,
-                examples=[
-                    OpenApiExample(
-                        'User ID',
-                        value='550e8400-e29b-41d4-a716-446655440000'
-                    )
-                ]
-            ),
-        ],
+        summary="Update user profile",
+        description="Partially updates the authenticated user's profile. Only whitelisted fields accepted.",
+        request=UserSerializer,
         responses={
-            200: OpenApiExample(
-                'Profile Retrieved',
-                value={
-                    'code': 200,
-                    'success': True,
-                    'data': {
-                        'user': {
-                            'id': '550e8400-e29b-41d4-a716-446655440000',
-                            'phone': '+2348012345678',
-                            'full_name': 'John Doe',
-                            'role': 'worker'
-                        },
-                        'wallet': {
-                            'balance': '5000.00',
-                            'escrow_balance': '1000.00',
-                            'virtual_account_number': '0700123456789',
-                            'bank_name': 'GTBank'
-                        },
-                        'stats': {
-                            'total_jobs_posted': 5,
-                            'total_jobs_completed': 3,
-                            'active_contracts': 1
-                        }
-                    }
-                }
-            ),
-            404: OpenApiExample(
-                'User Not Found',
-                value={
-                    'code': 404,
-                    'success': False,
-                    'message': 'User not found'
-                }
-            )
+            200: OpenApiResponse(response=UserSerializer, description="Updated user profile."),
+            400: OpenApiResponse(description="Non-updatable or invalid field supplied."),
+            401: OpenApiResponse(description="Not authenticated."),
         },
-        tags=['Users']
+        tags=["Profile"],
     )
-    def get(self, request, user_id, *args, **kwargs):
-        try:
-            user = User.objects.get(id=user_id)
-            user_serializer = UserSerializer(user)
+    def patch(self, request):
+        user = request.user
+        data = request.data
 
-            wallet = Wallet.objects.filter(user=user).first()
-            wallet_data = {
-                'balance': str(wallet.balance) if wallet else '0',
-                'escrow_balance': str(wallet.escrow_balance) if wallet else '0',
-                'virtual_account_number': wallet.virtual_account_number if wallet else None,
-                'bank_name': wallet.bank_name if wallet else None,
-            }
+        unknown_keys = set(data.keys()) - set(self.UPDATABLE_FIELDS)
+        if unknown_keys:
+            return Response(
+                {"detail": f"Field(s) not updatable: {', '.join(unknown_keys)}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-            from apps.jobs.models import Job
-            from apps.marketplace.models import Contract
-            from django.db import models as django_models
+        changed_fields = []
+        for field in self.UPDATABLE_FIELDS:
+            if field in data:
+                setattr(user, field, data[field])
+                changed_fields.append(field)
 
-            stats = {
-                'total_jobs_posted': Job.objects.filter(employer=user).count(),
-                'total_jobs_completed': Contract.objects.filter(worker=user, status='completed').count(),
-                'active_contracts': Contract.objects.filter(
-                    django_models.Q(employer=user) | django_models.Q(worker=user),
-                    status__in=['active', 'in_progress']
-                ).count(),
-            }
+        if changed_fields:
+            user.save(update_fields=changed_fields)
 
-            return Response({
-                'code': 200,
-                'success': True,
-                'data': {
-                    'user': user_serializer.data,
-                    'wallet': wallet_data,
-                    'stats': stats,
-                }
-            }, status=status.HTTP_200_OK)
-
-        except User.DoesNotExist:
-            return Response({
-                'code': 404,
-                'success': False,
-                'message': 'User not found'
-            }, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error fetching user profile: {str(e)}")
-            return Response({
-                'code': 500,
-                'success': False,
-                'message': 'Internal server error'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(UserSerializer(user).data)
 
 
-class OnboardingCompleteView(APIView):
-    permission_classes = [AllowAny]
-    """Mark user onboarding as complete."""
+class ChangePinView(APIView):
+    permission_classes = [IsAuthenticated]
 
     @extend_schema(
-        operation_id='users_onboarding_complete',
-        summary='Complete onboarding',
-        description='Mark user onboarding as complete. Requires authentication.',
-        parameters=[
-            OpenApiParameter(
-                name='user_id',
-                location=OpenApiParameter.PATH,
-                description='User UUID',
-                required=True,
-                type=OpenApiTypes.UUID,
-                examples=[
-                    OpenApiExample(
-                        'User ID',
-                        value='550e8400-e29b-41d4-a716-446655440000'
-                    )
-                ]
+        summary="Change PIN",
+        description="Changes the authenticated user's PIN. Requires current PIN for verification.",
+        request=ChangePinSerializer,
+        responses={
+            200: OpenApiResponse(description="PIN changed successfully."),
+            400: OpenApiResponse(description="Current PIN incorrect or validation failed."),
+            401: OpenApiResponse(description="Not authenticated."),
+        },
+        examples=[
+            OpenApiExample(
+                "Change PIN",
+                value={"current_pin": "1234", "new_pin": "5678"},
+                request_only=True,
             ),
         ],
-        responses={
-            200: OpenApiExample(
-                'Onboarding Completed',
-                value={
-                    'code': 200,
-                    'success': True,
-                    'message': 'Onboarding completed successfully'
-                }
-            ),
-            404: OpenApiExample(
-                'User Not Found',
-                value={
-                    'code': 404,
-                    'success': False,
-                    'message': 'User not found'
-                }
-            )
-        },
-        tags=['Users']
+        tags=["Auth"],
     )
-    def post(self, request, user_id, *args, **kwargs):
-        try:
-            user = User.objects.get(id=user_id)
-            user.onboarding_complete = True
-            user.save()
+    def post(self, request):
+        serializer = ChangePinSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-            return Response({
-                'code': 200,
-                'success': True,
-                'message': 'Onboarding completed successfully'
-            }, status=status.HTTP_200_OK)
+        user = request.user
+        data = serializer.validated_data
 
-        except User.DoesNotExist:
-            return Response({
-                'code': 404,
-                'success': False,
-                'message': 'User not found'
-            }, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error completing onboarding: {str(e)}")
-            return Response({
-                'code': 500,
-                'success': False,
-                'message': 'Internal server error'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        if not user.check_pin(data["current_pin"]):
+            return Response({"detail": "Current PIN is incorrect."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_pin(data["new_pin"])
+        user.save(update_fields=["pin"])
+        logger.info("PIN changed for user: %s", user.phone)
+        return Response({"detail": "PIN changed successfully."}, status=status.HTTP_200_OK)
 
 
-class OnboardingStatusView(APIView):
+class ResetPinRequestView(APIView):
     permission_classes = [AllowAny]
-    """Get onboarding status."""
 
-    def get(self, request, user_id, *args, **kwargs):
+    @extend_schema(
+        summary="Request PIN reset OTP",
+        description=(
+            "Sends a 6-digit OTP via SMS. Always returns 200 to prevent user enumeration. "
+            "OTP expires in 10 minutes."
+        ),
+        request=ResetPinRequestSerializer,
+        responses={
+            200: OpenApiResponse(description="OTP sent if number is registered."),
+            400: OpenApiResponse(description="Validation error."),
+            503: OpenApiResponse(description="SMS delivery failed."),
+        },
+        examples=[
+            OpenApiExample("Request OTP", value={"phone": "+2347061003002"}, request_only=True),
+        ],
+        tags=["PIN Reset"],
+    )
+    def post(self, request):
+        serializer = ResetPinRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        phone = serializer.validated_data["phone"]
+
         try:
-            user = User.objects.get(id=user_id)
-
-            return Response({
-                'code': 200,
-                'success': True,
-                'data': {
-                    'onboarding_complete': user.onboarding_complete,
-                    'is_verified': user.is_verified,
-                    'has_virtual_account': bool(user.squad_account_number),
-                }
-            }, status=status.HTTP_200_OK)
-
+            user = User.objects.get(phone=phone)
         except User.DoesNotExist:
-            return Response({
-                'code': 404,
-                'success': False,
-                'message': 'User not found'
-            }, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error fetching onboarding status: {str(e)}")
-            return Response({
-                'code': 500,
-                'success': False,
-                'message': 'Internal server error'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"detail": "If that number is registered, an OTP has been sent."}, status=status.HTTP_200_OK)
+
+        otp_record = PinResetOTP.create_for_user(user)
+
+        try:
+            _send_otp_sms(phone, otp_record.otp)
+        except Exception:
+            logger.exception("Failed to send OTP SMS to %s", phone)
+            return Response({"detail": "Could not send OTP. Please try again later."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        return Response({"detail": "If that number is registered, an OTP has been sent."}, status=status.HTTP_200_OK)
 
 
-class UserVirtualAccountView(APIView):
+class ResetPinConfirmView(APIView):
     permission_classes = [AllowAny]
-    """Get or create SQUAD virtual account for user."""
 
-    def get(self, request, user_id, *args, **kwargs):
+    @extend_schema(
+        summary="Confirm PIN reset with OTP",
+        description="Verifies OTP and sets new PIN. OTP must be unused and within 10-minute window.",
+        request=ResetPinConfirmSerializer,
+        responses={
+            200: OpenApiResponse(description="PIN reset successfully."),
+            400: OpenApiResponse(description="Invalid or expired OTP."),
+        },
+        examples=[
+            OpenApiExample(
+                "Confirm reset",
+                value={"phone": "+2347061003002", "otp": "482910", "new_pin": "5678"},
+                request_only=True,
+            ),
+        ],
+        tags=["PIN Reset"],
+    )
+    def post(self, request):
+        serializer = ResetPinConfirmSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+        phone = data["phone"]
+        otp_value = data["otp"]
+        new_pin = data["new_pin"]
+
         try:
-            user = User.objects.get(id=user_id)
-
-            if user.squad_account_number and user.squad_account_status == 'active':
-                return Response({
-                    'code': 200,
-                    'success': True,
-                    'data': {
-                        'virtual_account_number': user.squad_account_number,
-                        'bank_name': user.squad_bank_name,
-                        'account_status': user.squad_account_status,
-                    }
-                }, status=status.HTTP_200_OK)
-
-            try:
-                squad_service = SquadService()
-                full_name = user.full_name or f"User_{user.phone[-4:]}"
-                name_parts = full_name.split(' ', 1)
-                first_name = name_parts[0]
-                last_name = name_parts[1] if len(name_parts) > 1 else 'User'
-
-                dob = ''
-                if user.date_of_birth:
-                    dob = user.date_of_birth.strftime('%m/%d/%Y')
-
-                gender = '1'
-                if user.gender == 'F':
-                    gender = '2'
-
-                squad_response = squad_service.create_virtual_account(
-                    customer_identifier=str(user.id),
-                    first_name=first_name,
-                    last_name=last_name,
-                    middle_name='',
-                    phone=user.phone,
-                    email=user.email or f"{user.phone}@kolliq.ng",
-                    dob=dob,
-                    bvn=user.bvn or '',
-                    gender=gender,
-                    address=user.address or '',
-                )
-
-                user.squad_account_number = squad_response.get('virtual_account_number')
-                user.squad_bank_name = squad_response.get('bank_name', 'GTBank')
-                user.squad_account_status = 'active'
-                user.squad_account_created_at = timezone.now()
-                user.save()
-
-                wallet = Wallet.objects.filter(user=user).first()
-                if wallet:
-                    wallet.virtual_account_number = squad_response.get('virtual_account_number')
-                    wallet.bank_code = squad_response.get('bank_code', '058')
-                    wallet.save()
-
-                return Response({
-                    'code': 201,
-                    'success': True,
-                    'data': {
-                        'virtual_account_number': user.squad_account_number,
-                        'bank_name': user.squad_bank_name,
-                        'account_status': user.squad_account_status,
-                    }
-                }, status=status.HTTP_201_CREATED)
-
-            except SquadAPIError as e:
-                logger.error(f"Squad VA creation failed for user {user.id}: {str(e)}")
-                return Response({
-                    'code': 500,
-                    'success': False,
-                    'message': f"Failed to create virtual account: {str(e)}"
-                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
+            user = User.objects.get(phone=phone)
         except User.DoesNotExist:
-            return Response({
-                'code': 404,
-                'success': False,
-                'message': 'User not found'
-            }, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logger.error(f"Error in virtual account view: {str(e)}")
-            return Response({
-                'code': 500,
-                'success': False,
-                'message': 'Internal server error'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"detail": "Invalid or expired OTP."}, status=status.HTTP_400_BAD_REQUEST)
+
+        otp_record = (
+            PinResetOTP.objects
+            .filter(user=user, is_used=False)
+            .order_by("-created_at")
+            .first()
+        )
+
+        if not otp_record or not otp_record.is_valid or otp_record.otp != otp_value:
+            return Response({"detail": "Invalid or expired OTP."}, status=status.HTTP_400_BAD_REQUEST)
+
+        otp_record.is_used = True
+        otp_record.save(update_fields=["is_used"])
+
+        user.set_pin(new_pin)
+        user.save(update_fields=["pin"])
+
+        logger.info("PIN reset completed for user: %s", phone)
+        return Response({"detail": "PIN reset successfully."}, status=status.HTTP_200_OK)

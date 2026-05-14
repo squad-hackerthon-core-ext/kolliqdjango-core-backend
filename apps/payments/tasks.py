@@ -1,4 +1,7 @@
 from celery import shared_task
+from decimal import Decimal
+from django.conf import settings
+from django.db.models import Sum
 import logging
 
 logger = logging.getLogger(__name__)
@@ -116,3 +119,278 @@ def _handle_transfer_success(data: dict):
                 loan.save(update_fields=['status', 'updated_at'])
         except Loan.DoesNotExist:
             pass
+
+
+DRIFT_ALERT_THRESHOLD = Decimal(
+    str(getattr(settings, 'RECONCILIATION_DRIFT_THRESHOLD', '5000.00'))
+)
+ 
+# Alert if drift exceeds this % of expected balance
+DRIFT_PERCENT_THRESHOLD = Decimal(
+    str(getattr(settings, 'RECONCILIATION_DRIFT_PERCENT', '2.0'))
+)
+ 
+ 
+# ── Main Task ─────────────────────────────────────────────────────────────────
+ 
+@shared_task(
+    name='apps.payments.tasks.reconciliation.reconcile_merchant_account',
+    bind=True,
+    max_retries=3,
+    default_retry_delay=60,
+    autoretry_for=(Exception,),
+)
+def reconcile_merchant_account(self):
+    """
+    Core reconciliation task.
+    Runs every 6 hours via Celery Beat.
+    """
+    from apps.payments.models import Transaction, ReconciliationReport
+ 
+    logger.info('🔍 Starting merchant account reconciliation...')
+    started_at = timezone.now()
+ 
+    # ── Step 1: Calculate expected balance from DB ────────────────────────────
+    expected, breakdown = _calculate_expected_balance()
+ 
+    # ── Step 2: Fetch actual balance from Squad API ───────────────────────────
+    try:
+        actual = _fetch_squad_merchant_balance()
+    except Exception as e:
+        logger.error(f'Reconciliation failed — could not fetch Squad balance: {e}')
+        _save_report(
+            status='error',
+            expected=expected,
+            actual=None,
+            drift=None,
+            breakdown=breakdown,
+            error=str(e),
+            started_at=started_at,
+        )
+        return {
+            'status': 'error',
+            'message': f'Squad API unavailable: {e}',
+        }
+ 
+    # ── Step 3: Calculate drift ───────────────────────────────────────────────
+    drift         = actual - expected
+    drift_abs     = abs(drift)
+    drift_percent = (
+        (drift_abs / expected * 100)
+        if expected > 0
+        else Decimal('0')
+    )
+ 
+    # ── Step 4: Determine alert level ────────────────────────────────────────
+    is_critical = (
+        drift_abs > DRIFT_ALERT_THRESHOLD or
+        drift_percent > DRIFT_PERCENT_THRESHOLD
+    )
+ 
+    status = 'critical' if is_critical else 'ok'
+ 
+    # ── Step 5: Log result ────────────────────────────────────────────────────
+    log_fn = logger.critical if is_critical else logger.info
+    log_fn(
+        f'Reconciliation [{status.upper()}] | '
+        f'Expected: ₦{expected:,.2f} | '
+        f'Actual: ₦{actual:,.2f} | '
+        f'Drift: ₦{drift:+,.2f} ({drift_percent:.2f}%)'
+    )
+ 
+    if is_critical:
+        logger.critical(
+            f'⚠️  MERCHANT BALANCE DRIFT EXCEEDS THRESHOLD!\n'
+            f'   Expected : ₦{expected:,.2f}\n'
+            f'   Actual   : ₦{actual:,.2f}\n'
+            f'   Drift    : ₦{drift:+,.2f} ({drift_percent:.2f}%)\n'
+            f'   Breakdown: {breakdown}'
+        )
+        _fire_alert(expected, actual, drift, drift_percent, breakdown)
+ 
+    # ── Step 6: Save report ───────────────────────────────────────────────────
+    report = _save_report(
+        status=status,
+        expected=expected,
+        actual=actual,
+        drift=drift,
+        breakdown=breakdown,
+        error=None,
+        started_at=started_at,
+    )
+ 
+    logger.info(f'✅ Reconciliation complete. Report ID: {report.id}')
+ 
+    return {
+        'status':          status,
+        'expected':        str(expected),
+        'actual':          str(actual),
+        'drift':           str(drift),
+        'drift_percent':   str(drift_percent),
+        'is_critical':     is_critical,
+        'report_id':       str(report.id),
+    }
+ 
+ 
+# ── Expected Balance Calculator ───────────────────────────────────────────────
+ 
+def _calculate_expected_balance() -> tuple[Decimal, dict]:
+    """
+    Calculates what the Squad merchant account SHOULD contain based on
+    all successful Transaction records in our DB.
+ 
+    Logic:
+        + All ESCROW_HOLD amounts         (employers paid in)
+        - All CREDIT amounts (SUCCESS)    (workers paid out)
+        - All CREDIT amounts (PENDING)    (in-flight payouts — Squad already debited)
+        + All PLATFORM_FEE amounts        (our cut, stays in merchant acct)
+ 
+    Note: PENDING credits are subtracted because Squad debits the merchant
+    account immediately when a transfer is initiated, even if the credit
+    to the recipient is still processing.
+    """
+    from apps.payments.models import Transaction
+ 
+    TxType   = Transaction.Type
+    TxStatus = Transaction.Status
+ 
+    def total(tx_type, statuses):
+        result = Transaction.objects.filter(
+            transaction_type=tx_type,
+            status__in=statuses,
+        ).aggregate(total=Sum('amount'))['total']
+        return result or Decimal('0')
+ 
+    escrow_in    = total(TxType.ESCROW_HOLD,    [TxStatus.SUCCESS])
+    paid_out     = total(TxType.CREDIT,         [TxStatus.SUCCESS, TxStatus.PENDING])
+    platform_fee = total(TxType.PLATFORM_FEE,   [TxStatus.SUCCESS])
+ 
+    # Wallet top-ups / demo floats that came IN to merchant account
+    # (if you have a DEPOSIT or TOP_UP transaction type, include it here)
+    deposits = Decimal('0')
+    if hasattr(TxType, 'DEPOSIT'):
+        deposits = total(TxType.DEPOSIT, [TxStatus.SUCCESS])
+ 
+    expected = escrow_in - paid_out + platform_fee + deposits
+ 
+    breakdown = {
+        'escrow_in':    str(escrow_in),
+        'paid_out':     str(paid_out),
+        'platform_fee': str(platform_fee),
+        'deposits':     str(deposits),
+        'expected':     str(expected),
+    }
+ 
+    logger.debug(f'Expected balance breakdown: {breakdown}')
+    return expected, breakdown
+ 
+ 
+# ── Squad Balance Fetcher ─────────────────────────────────────────────────────
+ 
+def _fetch_squad_merchant_balance() -> Decimal:
+    """
+    Fetches the actual Squad merchant account balance via Squad's API.
+ 
+    Squad endpoint:
+        GET /merchant/balance
+        Authorization: Bearer {SQUAD_SECRET_KEY}
+ 
+    Response:
+        { "status": 200, "data": { "balance": 500000 } }  ← in kobo
+    """
+    import requests
+ 
+    url = f"{settings.SQUAD_BASE_URL}/merchant/balance"
+    headers = {
+        'Authorization': f'Bearer {settings.SQUAD_SECRET_KEY}',
+        'Content-Type':  'application/json',
+    }
+ 
+    response = requests.get(url, headers=headers, timeout=15)
+    data     = response.json()
+ 
+    if response.status_code != 200 or data.get('status') not in (200, '200'):
+        raise ValueError(
+            f"Squad balance API error: {data.get('message', 'Unknown error')}"
+        )
+ 
+    balance_kobo = data.get('data', {}).get('balance', 0)
+ 
+    # Squad returns balance in kobo — convert to naira
+    balance_naira = Decimal(str(balance_kobo)) / Decimal('100')
+ 
+    logger.debug(f'Squad merchant balance: ₦{balance_naira:,.2f}')
+    return balance_naira
+ 
+ 
+# ── Report Saver ──────────────────────────────────────────────────────────────
+ 
+def _save_report(status, expected, actual, drift, breakdown, error, started_at):
+    """Save reconciliation result to DB."""
+    from apps.payments.models import ReconciliationReport
+ 
+    return ReconciliationReport.objects.create(
+        status=status,
+        expected_balance=expected,
+        actual_balance=actual,
+        drift=drift,
+        drift_percent=(
+            abs(drift) / expected * 100
+            if expected and expected > 0 and drift is not None
+            else None
+        ),
+        breakdown=breakdown,
+        error_message=error or '',
+        ran_at=started_at,
+        completed_at=timezone.now(),
+    )
+ 
+ 
+# ── Alert Dispatcher ──────────────────────────────────────────────────────────
+ 
+def _fire_alert(expected, actual, drift, drift_percent, breakdown):
+    """
+    Fire alerts when drift is critical.
+    Tries Slack first, falls back to email.
+    Add/remove channels here as needed.
+    """
+    message = (
+        f"🚨 *Kolliq Merchant Balance Drift Alert*\n"
+        f"Expected : ₦{expected:,.2f}\n"
+        f"Actual   : ₦{actual:,.2f}\n"
+        f"Drift    : ₦{drift:+,.2f} ({drift_percent:.2f}%)\n"
+        f"Breakdown: Escrow in ₦{breakdown['escrow_in']} | "
+        f"Paid out ₦{breakdown['paid_out']} | "
+        f"Fees ₦{breakdown['platform_fee']}\n"
+        f"Action: Check Squad dashboard and transaction logs immediately."
+    )
+ 
+    # ── Slack ─────────────────────────────────────────────────────────────────
+    slack_webhook = getattr(settings, 'SLACK_ALERT_WEBHOOK_URL', None)
+    if slack_webhook:
+        try:
+            import requests
+            requests.post(
+                slack_webhook,
+                json={'text': message},
+                timeout=5,
+            )
+            logger.info('Reconciliation Slack alert sent.')
+        except Exception as e:
+            logger.warning(f'Slack alert failed: {e}')
+ 
+    # ── Email ─────────────────────────────────────────────────────────────────
+    alert_emails = getattr(settings, 'RECONCILIATION_ALERT_EMAILS', [])
+    if alert_emails:
+        try:
+            from django.core.mail import send_mail
+            send_mail(
+                subject='🚨 Kolliq Merchant Balance Drift Alert',
+                message=message.replace('*', '').replace('_', ''),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=alert_emails,
+                fail_silently=True,
+            )
+            logger.info(f'Reconciliation email alert sent to {alert_emails}.')
+        except Exception as e:
+            logger.warning(f'Email alert failed: {e}')

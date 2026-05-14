@@ -1,7 +1,11 @@
+from django.conf import settings
 import uuid
 from django.db import models
 from django.contrib.auth.hashers import make_password, check_password
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
+import random
+import string
+from django.utils import timezone
 
 
 class UserManager(BaseUserManager):
@@ -158,3 +162,62 @@ class User(AbstractBaseUser):
 
     def has_module_perms(self, app_label):
         return self.is_superuser
+
+class PinResetOTP(models.Model):
+    """
+    Stores a short-lived OTP for the PIN reset flow.
+ 
+    Flow:
+        POST /api/auth/reset-pin/request/  → generates & sends OTP
+        POST /api/auth/reset-pin/confirm/  → verifies OTP, sets new PIN
+ 
+    One active OTP per user at a time — requesting a new OTP invalidates
+    any previous ones (is_used=True on the old ones).
+    """
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='pin_reset_otps',
+    )
+    otp = models.CharField(max_length=8)
+    is_used = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+ 
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'PIN Reset OTP'
+        verbose_name_plural = 'PIN Reset OTPs'
+ 
+    def __str__(self):
+        return f"OTP for {self.user} — {'used' if self.is_used else 'active'}"
+ 
+    @staticmethod
+    def generate_otp(length: int = 6) -> str:
+        return ''.join(random.choices(string.digits, k=length))
+ 
+    @property
+    def is_expired(self) -> bool:
+        return timezone.now() > self.expires_at
+ 
+    @property
+    def is_valid(self) -> bool:
+        return not self.is_used and not self.is_expired
+ 
+    @classmethod
+    def create_for_user(cls, user, expiry_minutes: int = 10) -> 'PinResetOTP':
+        """
+        Invalidates all previous OTPs for this user and creates a fresh one.
+        expiry_minutes defaults to 10 — adjust in settings if needed.
+        """
+        # Invalidate any existing unused OTPs for this user
+        cls.objects.filter(user=user, is_used=False).update(is_used=True)
+ 
+        otp_value = cls.generate_otp()
+        expires_at = timezone.now() + timezone.timedelta(minutes=expiry_minutes)
+ 
+        return cls.objects.create(
+            user=user,
+            otp=otp_value,
+            expires_at=expires_at,
+        )

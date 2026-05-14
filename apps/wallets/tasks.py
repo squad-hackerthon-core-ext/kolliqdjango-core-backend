@@ -32,12 +32,14 @@ def create_wallet_for_user(self, user_id: str):
 
     name_parts = (user.full_name or 'Kolliq User').strip().split(' ', 1)
     first_name = name_parts[0]
-    last_name = name_parts[1] if len(name_parts) > 1 else first_name
+    middle_name = name_parts[1] if len(name_parts) >= 3 else ''
+    last_name = name_parts[1] if len(name_parts) >= 2 else first_name
 
     try:
         result = squad.create_virtual_account(
             customer_identifier=str(user.id),
             first_name=first_name,
+            middle_name=middle_name,
             last_name=last_name,
             phone=user.phone,
             email=f"{str(user.id)[:8]}@kolliq.app",
@@ -49,7 +51,7 @@ def create_wallet_for_user(self, user_id: str):
         )
 
         wallet.squad_account_number = result['virtual_account_number']
-        wallet.squad_account_name = f"{first_name} {last_name}"
+        wallet.squad_account_name = f"{first_name} {middle_name} {last_name}"
         wallet.squad_bank_name = result.get('bank_name', 'GTBank')
         wallet.squad_customer_id = result.get('customer_identifier', str(user.id))
         wallet.squad_virtual_account_ref = result['virtual_account_number']

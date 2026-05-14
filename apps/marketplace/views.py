@@ -1,6 +1,7 @@
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from drf_spectacular.utils import extend_schema
+from kolliq.permissions import IsAuthenticatedOrInternalSecret, resolve_user
+from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiExample
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
 from django.utils import timezone
@@ -16,6 +17,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 20
+BEARER_SECURITY = [{"bearerAuth": []}]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -23,20 +25,21 @@ PAGE_SIZE = 20
 # ══════════════════════════════════════════════════════════════════
 
 class CategoryListView(APIView):
-    """GET /api/marketplace/categories/ — public, no auth needed"""
     permission_classes = [AllowAny]
 
     @extend_schema(
         operation_id='marketplace_categories_list',
         summary='Get categories',
-        description='Get list of active marketplace categories',
+        description='Get list of active marketplace categories. No authentication required.',
+        request=None,
+        responses={
+            200: OpenApiResponse(response=CategorySerializer, description='List of active categories.'),
+        },
         tags=['Marketplace'],
     )
     def get(self, request):
         categories = Category.objects.filter(is_active=True)
-        return success_response({
-            'categories': CategorySerializer(categories, many=True).data
-        })
+        return success_response({'categories': CategorySerializer(categories, many=True).data})
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -44,18 +47,27 @@ class CategoryListView(APIView):
 # ══════════════════════════════════════════════════════════════════
 
 class ListingFeedView(APIView):
-    """
-    GET /api/marketplace/listings/
-    Public feed — filterable by category, city, search query, price range.
-    Featured listings always float to the top.
-    No auth required — buyers can browse without logging in.
-    """
     permission_classes = [AllowAny]
 
     @extend_schema(
         operation_id='marketplace_listings_list',
         summary='Get listings feed',
-        description='Get paginated list of active marketplace listings with filters',
+        description=(
+            'Paginated public feed of active listings. No authentication required. '
+            'Filter by category, city, search query, price range, condition, or seller. '
+            'Featured listings float to the top.'
+        ),
+        request=None,
+        responses={
+            200: OpenApiResponse(response=ListingListSerializer, description='Paginated listings.'),
+        },
+        examples=[
+            OpenApiExample(
+                'Response',
+                value={'listings': [], 'total': 0, 'page': 1, 'pages': 1},
+                response_only=True,
+            ),
+        ],
         tags=['Marketplace'],
     )
     def get(self, request):
@@ -63,7 +75,6 @@ class ListingFeedView(APIView):
             status=Listing.Status.ACTIVE
         ).select_related('seller', 'category').prefetch_related('images', 'saved_by')
 
-        # Filters
         category_slug = request.query_params.get('category')
         city = request.query_params.get('city')
         search = request.query_params.get('q')
@@ -91,21 +102,18 @@ class ListingFeedView(APIView):
         if condition:
             qs = qs.filter(condition=condition)
 
-        # Pagination
         try:
             page = max(1, int(request.query_params.get('page', 1)))
         except ValueError:
             page = 1
+
         start = (page - 1) * PAGE_SIZE
         end = start + PAGE_SIZE
-
         total = qs.count()
         listings = qs[start:end]
 
         return success_response({
-            'listings': ListingListSerializer(
-                listings, many=True, context={'request': request}
-            ).data,
+            'listings': ListingListSerializer(listings, many=True, context={'request': request}).data,
             'total': total,
             'page': page,
             'pages': (total + PAGE_SIZE - 1) // PAGE_SIZE,
@@ -113,13 +121,17 @@ class ListingFeedView(APIView):
 
 
 class ListingDetailView(APIView):
-    """GET /api/marketplace/listings/<id>/ — public"""
     permission_classes = [AllowAny]
 
     @extend_schema(
         operation_id='marketplace_listings_retrieve',
         summary='Get listing details',
-        description='Get detailed information for a specific listing',
+        description='Get detailed information for a specific listing. No authentication required.',
+        request=None,
+        responses={
+            200: OpenApiResponse(response=ListingDetailSerializer, description='Listing details.'),
+            404: OpenApiResponse(description='Listing not found or not active.'),
+        },
         tags=['Marketplace'],
     )
     def get(self, request, listing_id):
@@ -129,13 +141,10 @@ class ListingDetailView(APIView):
             status__in=[Listing.Status.ACTIVE, Listing.Status.PAUSED]
         )
 
-        # Async view increment — don't block the response
         from apps.marketplace.tasks import increment_listing_views
         increment_listing_views.delay(str(listing_id))
 
-        return success_response(
-            ListingDetailSerializer(listing, context={'request': request}).data
-        )
+        return success_response(ListingDetailSerializer(listing, context={'request': request}).data)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -143,26 +152,27 @@ class ListingDetailView(APIView):
 # ══════════════════════════════════════════════════════════════════
 
 class ListingCreateView(APIView):
-    """POST /api/marketplace/listings/create/"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_listings_create',
         summary='Create listing',
-        description='Create a new marketplace listing',
+        description='Create a new marketplace listing. Triggers score recalculation.',
         request=ListingCreateSerializer,
+        responses={
+            201: OpenApiResponse(response=ListingDetailSerializer, description='Listing created.'),
+            400: OpenApiResponse(description='Validation error.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
         tags=['Marketplace'],
     )
     def post(self, request):
-        serializer = ListingCreateSerializer(
-            data=request.data, context={'request': request}
-        )
+        serializer = ListingCreateSerializer(data=request.data, context={'request': request})
         if not serializer.is_valid():
             return error_response(serializer.errors)
 
         listing = serializer.save()
 
-        # Recalculate score — creating a listing is a positive signal
         from apps.scoring.tasks import recalculate_score
         recalculate_score.delay(str(request.user.id))
 
@@ -173,52 +183,76 @@ class ListingCreateView(APIView):
 
 
 class ListingUpdateView(APIView):
-    """PATCH /api/marketplace/listings/<id>/update/"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_listings_update',
         summary='Update listing',
-        description='Update an existing marketplace listing',
+        description='Partially update an existing listing. Only the listing owner can update.',
         request=ListingUpdateSerializer,
+        responses={
+            200: OpenApiResponse(response=ListingDetailSerializer, description='Updated listing.'),
+            400: OpenApiResponse(description='Validation error.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            404: OpenApiResponse(description='Listing not found or not owned by user.'),
+        },
         tags=['Marketplace'],
     )
     def patch(self, request, listing_id):
         listing = get_object_or_404(Listing, id=listing_id, seller=request.user)
-
         serializer = ListingUpdateSerializer(listing, data=request.data, partial=True)
         if not serializer.is_valid():
             return error_response(serializer.errors)
 
         listing = serializer.save()
-        return success_response(
-            ListingDetailSerializer(listing, context={'request': request}).data
-        )
+        return success_response(ListingDetailSerializer(listing, context={'request': request}).data)
 
 
 class ListingPurchaseView(APIView):
-    """
-    POST /api/marketplace/listings/<id>/purchase/
-    Buyer purchases a listing using their Kolliq wallet balance.
-    Pure internal ledger — no Squad API call.
-
-    Body:
-        quantity: integer   (default 1)
-        message: string     (optional note to seller)
-    """
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(
+        operation_id='marketplace_listings_purchase',
+        summary='Purchase listing',
+        description=(
+            'Buy a listing using Kolliq wallet balance. '
+            'Pure internal ledger transfer — no external payment call. '
+            'Platform takes a 2% fee; seller receives the remainder. '
+            'Seller is notified via SMS on purchase.'
+        ),
+        request=None,
+        responses={
+            201: OpenApiResponse(description='Purchase completed successfully.'),
+            400: OpenApiResponse(description='Insufficient balance, invalid quantity, or own listing.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            404: OpenApiResponse(description='Listing not found or wallet not ready.'),
+        },
+        examples=[
+            OpenApiExample('Request', value={'quantity': 1, 'message': 'I will pick up tomorrow'}, request_only=True),
+            OpenApiExample(
+                'Response',
+                value={
+                    'reference': 'MKT-listing-buyer',
+                    'quantity': 1,
+                    'total_paid': '5000.00',
+                    'platform_fee': '100.00',
+                    'seller_received': '4900.00',
+                    'your_new_balance': '10000.00',
+                    'status': 'completed',
+                },
+                response_only=True,
+            ),
+        ],
+        tags=['Marketplace'],
+    )
     def post(self, request, listing_id):
         from apps.marketplace.models import Listing, Enquiry
         from apps.payments.models import Transaction
         from django.db import transaction as db_transaction
-        from django.shortcuts import get_object_or_404
         from decimal import Decimal
 
         buyer = request.user
-        listing = get_object_or_404(
-            Listing, id=listing_id, status='active'
-        )
+        listing = get_object_or_404(Listing, id=listing_id, status='active')
 
         if listing.seller == buyer:
             return error_response('You cannot purchase your own listing.')
@@ -228,15 +262,12 @@ class ListingPurchaseView(APIView):
             return error_response('Quantity must be at least 1.')
 
         if quantity > listing.quantity_available:
-            return error_response(
-                f'Only {listing.quantity_available} available.'
-            )
+            return error_response(f'Only {listing.quantity_available} available.')
 
         total = listing.price * quantity
         PLATFORM_CUT = (total * Decimal('0.02')).quantize(Decimal('0.01'))
         seller_receives = total - PLATFORM_CUT
 
-        # Check buyer balance
         try:
             buyer_wallet = buyer.wallet
         except Exception:
@@ -244,9 +275,7 @@ class ListingPurchaseView(APIView):
 
         if buyer_wallet.balance < total:
             return error_response(
-                f'Insufficient balance. '
-                f'Need ₦{total}, you have ₦{buyer_wallet.balance}. '
-                f'Top up your wallet first.'
+                f'Insufficient balance. Need ₦{total}, you have ₦{buyer_wallet.balance}. Top up your wallet first.'
             )
 
         seller = listing.seller
@@ -258,35 +287,20 @@ class ListingPurchaseView(APIView):
         reference = f"MKT-{listing.id}-{buyer.id}"[:40]
 
         with db_transaction.atomic():
-            # Lock both wallets
-            buyer_wallet = type(buyer_wallet).objects.select_for_update().get(
-                user=buyer
-            )
-            seller_wallet = type(seller_wallet).objects.select_for_update().get(
-                user=seller
-            )
+            buyer_wallet = type(buyer_wallet).objects.select_for_update().get(user=buyer)
+            seller_wallet = type(seller_wallet).objects.select_for_update().get(user=seller)
 
-            # Re-check after lock
             if buyer_wallet.balance < total:
-                return error_response(
-                    f'Insufficient balance: ₦{buyer_wallet.balance}.'
-                )
+                return error_response(f'Insufficient balance: ₦{buyer_wallet.balance}.')
 
-            # Debit buyer
             buyer_wallet.debit(total)
-
-            # Credit seller (minus platform cut)
             seller_wallet.credit(seller_receives)
 
-            # Reduce listing quantity
             listing.quantity_available -= quantity
             if listing.quantity_available == 0:
                 listing.status = 'sold'
-            listing.save(update_fields=[
-                'quantity_available', 'status', 'updated_at'
-            ])
+            listing.save(update_fields=['quantity_available', 'status', 'updated_at'])
 
-            # Transaction records
             Transaction.objects.create(
                 user=buyer,
                 transaction_type=Transaction.Type.DEBIT,
@@ -294,12 +308,7 @@ class ListingPurchaseView(APIView):
                 status=Transaction.Status.SUCCESS,
                 related_user=seller,
                 description=f'Purchase: {listing.title} x{quantity}',
-                metadata={
-                    'type': 'marketplace_purchase',
-                    'listing_id': str(listing.id),
-                    'quantity': quantity,
-                    'reference': reference,
-                }
+                metadata={'type': 'marketplace_purchase', 'listing_id': str(listing.id), 'quantity': quantity, 'reference': reference},
             )
             Transaction.objects.create(
                 user=seller,
@@ -308,25 +317,16 @@ class ListingPurchaseView(APIView):
                 status=Transaction.Status.SUCCESS,
                 related_user=buyer,
                 description=f'Sale: {listing.title} x{quantity}',
-                metadata={
-                    'type': 'marketplace_sale',
-                    'listing_id': str(listing.id),
-                    'platform_fee': str(PLATFORM_CUT),
-                    'reference': reference,
-                }
+                metadata={'type': 'marketplace_sale', 'listing_id': str(listing.id), 'platform_fee': str(PLATFORM_CUT), 'reference': reference},
             )
 
-        # Notify seller
         from services.africas_talking import ATService
         at = ATService()
         at.send_sms(
             seller.phone,
-            f"Kolliq: {buyer.display_name} bought {quantity}x "
-            f"'{listing.title}' for ₦{seller_receives}. "
-            f"Balance: ₦{seller_wallet.balance}."
+            f"Kolliq: {buyer.display_name} bought {quantity}x '{listing.title}' for ₦{seller_receives}. Balance: ₦{seller_wallet.balance}."
         )
 
-        # Recalculate seller score
         from apps.scoring.tasks import recalculate_score
         recalculate_score.delay(str(seller.id))
 
@@ -339,21 +339,23 @@ class ListingPurchaseView(APIView):
             'seller_received': str(seller_receives),
             'your_new_balance': str(buyer_wallet.balance),
             'status': 'completed',
-            'message': (
-                f'Purchase complete! ₦{total} paid. '
-                f'Contact {seller.display_name} to arrange pickup.'
-            ),
+            'message': f'Purchase complete! ₦{total} paid. Contact {seller.display_name} to arrange pickup.',
         }, status=201)
 
 
 class ListingDeleteView(APIView):
-    """DELETE /api/marketplace/listings/<id>/delete/"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_listings_delete',
         summary='Delete listing',
-        description='Delete a marketplace listing',
+        description='Soft-delete a listing by marking it as removed. Only the listing owner can delete.',
+        request=None,
+        responses={
+            200: OpenApiResponse(description='Listing removed.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            404: OpenApiResponse(description='Listing not found or not owned by user.'),
+        },
         tags=['Marketplace'],
     )
     def delete(self, request, listing_id):
@@ -364,13 +366,17 @@ class ListingDeleteView(APIView):
 
 
 class MyListingsView(APIView):
-    """GET /api/marketplace/listings/mine/ — seller sees their own listings"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_my_listings_list',
         summary='Get my listings',
-        description='Get all listings posted by current user',
+        description='Get all listings posted by the authenticated user. Filter by status via ?status= query param.',
+        request=None,
+        responses={
+            200: OpenApiResponse(response=ListingListSerializer, description='User listings.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
         tags=['Marketplace'],
     )
     def get(self, request):
@@ -380,9 +386,7 @@ class MyListingsView(APIView):
             qs = qs.filter(status=status_filter)
         qs = qs.order_by('-created_at')
         return success_response({
-            'listings': ListingListSerializer(
-                qs, many=True, context={'request': request}
-            ).data,
+            'listings': ListingListSerializer(qs, many=True, context={'request': request}).data,
             'count': qs.count(),
         })
 
@@ -392,30 +396,28 @@ class MyListingsView(APIView):
 # ══════════════════════════════════════════════════════════════════
 
 class ListingImageAddView(APIView):
-    """
-    POST /api/marketplace/listings/<id>/images/
-    Frontend uploads image to Cloudflare R2 first, then sends URL here.
-    We store the URL — no file processing on Django side.
-    """
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_listing_images_create',
         summary='Add listing image',
-        description='Add image to a listing',
+        description='Add an image URL to a listing. Frontend uploads to Cloudflare R2 first, then sends the URL here.',
         request=ListingImageCreateSerializer,
+        responses={
+            201: OpenApiResponse(description='Image added.'),
+            400: OpenApiResponse(description='Validation error.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            404: OpenApiResponse(description='Listing not found or not owned by user.'),
+        },
         tags=['Marketplace'],
     )
     def post(self, request, listing_id):
         listing = get_object_or_404(Listing, id=listing_id, seller=request.user)
         data = {**request.data, 'listing': str(listing.id)}
-        serializer = ListingImageCreateSerializer(
-            data=data, context={'request': request}
-        )
+        serializer = ListingImageCreateSerializer(data=data, context={'request': request})
         if not serializer.is_valid():
             return error_response(serializer.errors)
 
-        # If this is marked primary, clear existing primary
         if serializer.validated_data.get('is_primary'):
             listing.images.filter(is_primary=True).update(is_primary=False)
 
@@ -429,11 +431,17 @@ class ListingImageAddView(APIView):
     @extend_schema(
         operation_id='marketplace_listing_images_delete',
         summary='Delete listing image',
-        description='Delete an image from a listing',
+        description='Delete an image from a listing using ?image_id= query param.',
+        request=None,
+        responses={
+            200: OpenApiResponse(description='Image removed.'),
+            400: OpenApiResponse(description='image_id query param missing.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            404: OpenApiResponse(description='Image or listing not found.'),
+        },
         tags=['Marketplace'],
     )
     def delete(self, request, listing_id):
-        """DELETE /api/marketplace/listings/<id>/images/?image_id=<id>"""
         image_id = request.query_params.get('image_id')
         if not image_id:
             return error_response('image_id query param required.')
@@ -448,26 +456,31 @@ class ListingImageAddView(APIView):
 # ══════════════════════════════════════════════════════════════════
 
 class EnquiryCreateView(APIView):
-    """POST /api/marketplace/enquiries/ — buyer contacts seller"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='marketplace_enquiries_create',
         summary='Create enquiry',
-        description='Send enquiry to listing seller',
+        description='Send an enquiry to a listing seller. Seller is notified via SMS.',
         request=EnquiryCreateSerializer,
+        responses={
+            201: OpenApiResponse(description='Enquiry sent.'),
+            400: OpenApiResponse(description='Validation error.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
         tags=['Marketplace'],
     )
     def post(self, request):
-        serializer = EnquiryCreateSerializer(
-            data=request.data, context={'request': request}
-        )
+        user, err = resolve_user(request)
+        if err:
+            return err
+        serializer = EnquiryCreateSerializer(data=request.data, context={'request': request, 'user': user})
+        
         if not serializer.is_valid():
             return error_response(serializer.errors)
 
         enquiry = serializer.save()
 
-        # Notify seller via SMS
         from apps.marketplace.tasks import notify_seller_new_enquiry
         notify_seller_new_enquiry.delay(str(enquiry.id))
 
@@ -484,13 +497,17 @@ class EnquiryCreateView(APIView):
 
 
 class MyEnquiriesView(APIView):
-    """GET /api/marketplace/enquiries/mine/ — buyer sees their sent enquiries"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_my_enquiries_list',
         summary='Get my enquiries',
-        description='Get enquiries sent by current user',
+        description='Get all enquiries sent by the authenticated user.',
+        request=None,
+        responses={
+            200: OpenApiResponse(response=EnquirySerializer, description='Sent enquiries.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
         tags=['Marketplace'],
     )
     def get(self, request):
@@ -504,13 +521,17 @@ class MyEnquiriesView(APIView):
 
 
 class SellerEnquiriesView(APIView):
-    """GET /api/marketplace/enquiries/received/ — seller sees incoming enquiries"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_seller_enquiries_list',
         summary='Get received enquiries',
-        description='Get enquiries received by current seller',
+        description='Get enquiries received on the authenticated seller\'s listings. Filter by ?listing_id= query param.',
+        request=None,
+        responses={
+            200: OpenApiResponse(response=EnquirySerializer, description='Received enquiries.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
         tags=['Marketplace'],
     )
     def get(self, request):
@@ -527,21 +548,22 @@ class SellerEnquiriesView(APIView):
 
 
 class EnquiryRespondView(APIView):
-    """PATCH /api/marketplace/enquiries/<id>/respond/ — seller marks responded"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_enquiries_respond',
         summary='Mark enquiry as responded',
-        description='Mark enquiry as responded by seller',
+        description='Mark an enquiry as responded. Only the listing seller can respond.',
+        request=None,
+        responses={
+            200: OpenApiResponse(description='Enquiry marked as responded.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            404: OpenApiResponse(description='Enquiry not found or not owned by seller.'),
+        },
         tags=['Marketplace'],
     )
     def patch(self, request, enquiry_id):
-        enquiry = get_object_or_404(
-            Enquiry,
-            id=enquiry_id,
-            listing__seller=request.user
-        )
+        enquiry = get_object_or_404(Enquiry, id=enquiry_id, listing__seller=request.user)
         enquiry.status = Enquiry.Status.RESPONDED
         enquiry.save(update_fields=['status', 'updated_at'])
         return success_response({'status': 'responded'})
@@ -552,20 +574,24 @@ class EnquiryRespondView(APIView):
 # ══════════════════════════════════════════════════════════════════
 
 class SaveListingView(APIView):
-    """POST /api/marketplace/listings/<id>/save/ — toggle save"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_listings_save',
         summary='Save or unsave listing',
-        description='Toggle saved status for a listing',
+        description='Toggle saved status for a listing. Calling again on a saved listing removes it.',
+        request=None,
+        responses={
+            201: OpenApiResponse(description='Listing saved.'),
+            200: OpenApiResponse(description='Listing removed from saved.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+            404: OpenApiResponse(description='Listing not found.'),
+        },
         tags=['Marketplace'],
     )
     def post(self, request, listing_id):
         listing = get_object_or_404(Listing, id=listing_id)
-        saved, created = SavedListing.objects.get_or_create(
-            user=request.user, listing=listing
-        )
+        saved, created = SavedListing.objects.get_or_create(user=request.user, listing=listing)
         if not created:
             saved.delete()
             return success_response({'saved': False, 'message': 'Removed from saved.'})
@@ -573,13 +599,17 @@ class SaveListingView(APIView):
 
 
 class SavedListingsView(APIView):
-    """GET /api/marketplace/listings/saved/ — buyer's saved listings"""
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         operation_id='marketplace_saved_listings_list',
         summary='Get saved listings',
-        description='Get all listings saved by current user',
+        description='Get all active listings saved by the authenticated user.',
+        request=None,
+        responses={
+            200: OpenApiResponse(response=ListingListSerializer, description='Saved listings.'),
+            401: OpenApiResponse(description='Not authenticated.'),
+        },
         tags=['Marketplace'],
     )
     def get(self, request):
@@ -590,8 +620,6 @@ class SavedListingsView(APIView):
         ).order_by('-created_at')
         listings = [s.listing for s in saved if s.listing.status == 'active']
         return success_response({
-            'listings': ListingListSerializer(
-                listings, many=True, context={'request': request}
-            ).data,
+            'listings': ListingListSerializer(listings, many=True, context={'request': request}).data,
             'count': len(listings),
         })

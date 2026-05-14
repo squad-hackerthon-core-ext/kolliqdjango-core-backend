@@ -1,5 +1,6 @@
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated, AllowAny
+from kolliq.permissions import IsAuthenticatedOrInternalSecret, resolve_user
 from drf_spectacular.utils import extend_schema
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -63,7 +64,7 @@ class JobCreateView(APIView):
     Employer posts a new job. Called by WhatsApp bot (Node) or app.
     Returns a Squad payment link for escrow deposit.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='jobs_create',
@@ -73,10 +74,14 @@ class JobCreateView(APIView):
         tags=['Jobs'],
     )
     def post(self, request):
-        if request.user.role != 'employer':
+        user, err = resolve_user(request)
+        if err:
+            return err
+
+        if user.role != 'employer':
             return error_response('Only employers can post jobs.', status=403)
 
-        serializer = JobCreateSerializer(data=request.data, context={'request': request})
+        serializer = JobCreateSerializer(data=request.data, context={'request': request, 'user': user})
         if not serializer.is_valid():
             return error_response(serializer.errors)
 
@@ -106,7 +111,7 @@ class JobAcceptView(APIView):
     Worker accepts a job from their feed.
     Body: { "job_id": "uuid" }
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='jobs_accept',
@@ -115,7 +120,9 @@ class JobAcceptView(APIView):
         tags=['Jobs'],
     )
     def post(self, request):
-        user = request.user
+        user, err = resolve_user(request)
+        if err:
+            return err
         if user.role != 'worker':
             return error_response('Only workers can accept jobs.', status=403)
 
@@ -235,7 +242,7 @@ class JobCompleteView(APIView):
 
 
 class JobDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedOrInternalSecret]
 
     @extend_schema(
         operation_id='jobs_retrieve',

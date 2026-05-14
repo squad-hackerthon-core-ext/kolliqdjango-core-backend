@@ -26,6 +26,7 @@ THIRD_PARTY_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
+    'rest_framework.authtoken',
     'drf_spectacular',
     'corsheaders',
     'django_celery_beat',
@@ -41,6 +42,7 @@ LOCAL_APPS = [
     'apps.financial_services',
     'apps.partner',
     'apps.marketplace',
+    'services',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -120,6 +122,7 @@ AUTH_USER_MODEL = 'users.User'
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'rest_framework.authentication.TokenAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.AllowAny',
@@ -133,7 +136,7 @@ REST_FRAMEWORK = {
 
 from datetime import timedelta
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=1),
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=7),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
     'ROTATE_REFRESH_TOKENS': True,
     'AUTH_HEADER_TYPES': ('Bearer',),
@@ -179,12 +182,7 @@ SPECTACULAR_SETTINGS = {
     'POSTPROCESSING_HOOKS': [],
     'TAGS_SORTER': None,
     'OPERATION_SORTER': None,
-}
 
-from datetime import timedelta
-SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=7),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
 }
 
 if DEBUG:
@@ -222,6 +220,7 @@ AT_SENDER_ID = env('AT_SENDER_ID', default='KOLLIQ')
 # Platform Config
 PLATFORM_FEE_PERCENT = env.int('PLATFORM_FEE_PERCENT', default=5)
 ARISE_WALLET_ID = env.int('ARISE_WALLET_ID', default=1)
+DEMO_FLOAT_WALLET_ID = env.int('DEMO_FLOAT_WALLET_ID', default=2)
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
@@ -301,6 +300,23 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.marketplace.tasks.flag_suspicious_listings',
         'schedule': crontab(minute=30),  # offset from main fraud sweep
     },
+    # ── Reconciliation — runs every 6 hours ───────────────────────────────────
+    'reconcile-merchant-account': {
+        'task':     'apps.payments.tasks.reconciliation.reconcile_merchant_account',
+        'schedule': crontab(minute=0, hour='*/6'),   # 00:00, 06:00, 12:00, 18:00
+        'options': {
+            'expires': 60 * 60,   # task expires after 1 hour if not picked up
+        },
+    },
+
+    # ── Daily summary report — midnight Lagos time (UTC+1) ────────────────────
+    'reconcile-daily-summary': {
+        'task':     'apps.payments.tasks.reconciliation.reconcile_merchant_account',
+        'schedule': crontab(minute=0, hour=23),      # 11pm UTC = midnight WAT
+        'options': {
+            'expires': 60 * 60,
+        },
+    },
 }
 
 CSRF_TRUSTED_ORIGINS = env.list(
@@ -311,3 +327,30 @@ CSRF_TRUSTED_ORIGINS = env.list(
         'https://*.ngrok-free.dev',
     ]
 )
+# ── Paste into your settings.py (or settings/base.py) ────────────────────────
+"""
+Reconciliation Settings
+========================
+Add these to your Django settings file.
+"""
+
+from celery.schedules import crontab
+
+# ── Reconciliation thresholds ─────────────────────────────────────────────────
+
+# Fire alert if drift exceeds this naira amount
+RECONCILIATION_DRIFT_THRESHOLD = 5000.00   # ₦5,000
+
+# Fire alert if drift exceeds this % of expected balance
+RECONCILIATION_DRIFT_PERCENT   = 2.0       # 2%
+
+# Who to email when drift is critical
+RECONCILIATION_ALERT_EMAILS = [
+    'xpsiders@gmail.com',   # replace with your real addresses
+    'tech@kolliq.app',
+]
+
+# Slack incoming webhook URL (optional — set to None to disable)
+SLACK_ALERT_WEBHOOK_URL = None  # e.g. 'https://hooks.slack.com/services/xxx/yyy/zzz'
+
+

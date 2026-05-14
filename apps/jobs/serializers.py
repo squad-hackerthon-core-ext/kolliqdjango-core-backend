@@ -45,7 +45,7 @@ class JobCreateSerializer(serializers.ModelSerializer):
         ]
 
     def create(self, validated_data):
-        employer = self.context['request'].user
+        employer = self.context.get('user') or self.context.get('request').user
         return Job.objects.create(employer=employer, **validated_data)
 
 

@@ -181,7 +181,7 @@ class EnquiryCreateSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
-        user = self.context['request'].user
+        user = self.context.get('user') or self.context['request'].user  # passed from view after resolve_user
         enquiry = Enquiry.objects.create(
             buyer=user,
             buyer_phone=validated_data.pop('buyer_phone', '') or user.phone,

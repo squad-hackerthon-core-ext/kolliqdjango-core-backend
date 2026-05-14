@@ -75,3 +75,4 @@ def notify_loan_disbursed(user_id: str, amount: str, repayment_date: str):
         at.send_sms(user.phone, message)
     except User.DoesNotExist:
         logger.error(f"notify_loan_disbursed: User {user_id} not found")
+

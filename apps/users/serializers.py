@@ -96,6 +96,7 @@ class UserCreateSerializer(serializers.Serializer):
 
 
 class LoginSerializer(serializers.Serializer):
+
     """Validates login credentials (phone + PIN)."""
 
     phone = serializers.CharField(max_length=20)
@@ -108,3 +109,64 @@ class LoginSerializer(serializers.Serializer):
         if not value.isdigit():
             raise serializers.ValidationError("PIN must contain digits only.")
         return value
+
+class ChangePinSerializer(serializers.Serializer):
+    """Authenticated user changing their own PIN — requires old PIN for verification."""
+    current_pin = serializers.CharField(
+        min_length=4,
+        max_length=6,
+        write_only=True,
+    )
+    new_pin = serializers.CharField(
+        min_length=4,
+        max_length=6,
+        write_only=True,
+    )
+    confirm_new_pin = serializers.CharField(
+        min_length=4,
+        max_length=6,
+        write_only=True,
+    )
+ 
+    def validate(self, attrs):
+        if attrs['new_pin'] != attrs['confirm_new_pin']:
+            raise serializers.ValidationError({
+                'confirm_new_pin': 'New PIN and confirm PIN do not match.'
+            })
+        if attrs['current_pin'] == attrs['new_pin']:
+            raise serializers.ValidationError({
+                'new_pin': 'New PIN must be different from your current PIN.'
+            })
+        return attrs
+ 
+ 
+class ResetPinRequestSerializer(serializers.Serializer):
+    """Step 1 — request a reset OTP via phone number."""
+    phone = serializers.CharField(max_length=20)
+ 
+    def validate_phone(self, value):
+        value = value.strip()
+        if value.startswith('0'):
+            value = '+234' + value[1:]
+        return value
+ 
+ 
+class ResetPinConfirmSerializer(serializers.Serializer):
+    """Step 2 — verify OTP and set a new PIN."""
+    phone = serializers.CharField(max_length=20)
+    otp = serializers.CharField(min_length=4, max_length=8, write_only=True)
+    new_pin = serializers.CharField(min_length=4, max_length=6, write_only=True)
+    confirm_new_pin = serializers.CharField(min_length=4, max_length=6, write_only=True)
+ 
+    def validate_phone(self, value):
+        value = value.strip()
+        if value.startswith('0'):
+            value = '+234' + value[1:]
+        return value
+ 
+    def validate(self, attrs):
+        if attrs['new_pin'] != attrs['confirm_new_pin']:
+            raise serializers.ValidationError({
+                'confirm_new_pin': 'New PIN and confirm PIN do not match.'
+            })
+        return attrs

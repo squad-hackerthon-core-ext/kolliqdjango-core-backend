@@ -17,7 +17,7 @@ class LoanApplySerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('500'))
 
     def validate_amount(self, value):
-        user = self.context['request'].user
+        user = self.context.get('user') or self.context['request'].user
         # Check against active loan
         if user.loans.filter(status__in=['pending', 'active', 'partially_repaid']).exists():
             raise serializers.ValidationError('You already have an active loan.')
