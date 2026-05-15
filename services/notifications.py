@@ -16,7 +16,7 @@ def notify_employer_acceptance(application):
     employer = job.employer
 
     message = (
-        f"Kolliq: {worker.fulll_name or worker.phone} has accepted your job '{job.title}'. "
+        f"Kolliq: {worker.full_name or worker.phone} has accepted your job '{job.title}'. "
         f"Contact: {worker.phone}. "
         f"Reply 'done {str(job.id)[:8]}' when complete."
     )
