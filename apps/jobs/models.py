@@ -19,7 +19,7 @@ class Job(UserOrganizedModel):
         DELIVERY = 'delivery', 'Delivery/Dispatch'
         COOKING = 'cooking', 'Cooking/Catering'
         CONSTRUCTION = 'construction', 'Construction/Labour'
-        MARKET = 'market', 'Market Assistant'
+        MARKET = 'market_assistant', 'Market Assistant'
         CLEANING = 'cleaning', 'Cleaning'
         SECURITY = 'security', 'Security'
         TEACHING = 'teaching', 'Teaching/Tutoring'
