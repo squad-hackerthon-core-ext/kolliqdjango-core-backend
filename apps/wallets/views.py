@@ -7,6 +7,7 @@ from rest_framework.views import APIView
 from kolliq.permissions import IsAuthenticatedOrInternalSecret, resolve_user
 from drf_spectacular.utils import extend_schema
 from kolliq.utils import success_response, error_response
+from services.squad import NIGERIAN_BANKS, get_bank_name, verify_bank_account
 from .models import Wallet
 from apps.wallets.serializers import (
     NigerianBankSerializer,

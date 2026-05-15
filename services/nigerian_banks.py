@@ -61,6 +61,9 @@ NIGERIAN_BANKS = [
     {'code': '090317', 'name': 'PatrickGold Microfinance Bank'},
     {'code': '090115', 'name': 'TCF MFB'},
     {'code': '090251', 'name': 'Covenant MFB'},
+    {'code': '090300', 'name': 'FBN Mortgages Limited'},
+    {'code': '090112', 'name': 'VFD MFB'},
+    
 ]
 
 # Sort alphabetically for clean dropdown display
