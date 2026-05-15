@@ -9,11 +9,15 @@ from drf_spectacular.utils import extend_schema
 from kolliq.utils import success_response, error_response
 from services.squad import NIGERIAN_BANKS, get_bank_name, verify_bank_account
 from .models import Wallet
+from django.db import transaction as db_transaction
 from apps.wallets.serializers import (
     NigerianBankSerializer,
     BankAccountVerifySerializer,
     BankAccountSaveSerializer,
     BankAccountDetailSerializer,
+    WithdrawalRequestSerializer,
+    WithdrawalDetailSerializer,
+
 )
 
 
@@ -210,3 +214,78 @@ class BankAccountSaveView(APIView):
             'account_name':   data['bank_account_name'],
             'message':        'Bank account saved successfully. You can now receive payouts.',
         }, status=status.HTTP_200_OK)
+
+class WithdrawalRequestView(APIView):
+    """
+    POST /wallets/withdraw/
+    Body: { "amount": 5000 }
+
+    Deducts from wallet immediately and creates a PENDING withdrawal.
+    Admin must approve → triggers Squad payout transfer.
+    Minimum: ₦2,500.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = WithdrawalRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        amount = serializer.validated_data['amount']
+        wallet = getattr(request.user, 'wallet', None)
+
+        if not wallet:
+            return Response(
+                {'detail': 'Wallet not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not wallet.bank_account_verified:
+            return Response(
+                {'detail': 'Please save a verified bank account before withdrawing.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            with db_transaction.atomic():
+                wallet.debit(amount)  # raises ValueError if insufficient
+                withdrawal = WithdrawalRequest.objects.create(
+                    wallet=wallet,
+                    amount=amount,
+                    bank_account_number=wallet.bank_account_number,
+                    bank_code=wallet.bank_code,
+                    bank_name=wallet.bank_name,
+                    bank_account_name=wallet.bank_account_name,
+                    status=WithdrawalRequest.Status.PENDING,
+                )
+        except ValueError as e:
+            return Response(
+                {'detail': str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        logger.info(
+            f"Withdrawal requested: user={request.user.id} "
+            f"amount=₦{amount} withdrawal_id={withdrawal.id}"
+        )
+
+        return Response({
+            'success': True,
+            'withdrawal_id': str(withdrawal.id),
+            'amount': str(amount),
+            'bank_name': wallet.bank_name,
+            'account_number': wallet.bank_account_number,
+            'account_name': wallet.bank_account_name,
+            'status': 'pending',
+            'message': 'Withdrawal request submitted. Processing within 24 hours.',
+        }, status=status.HTTP_201_CREATED)
+
+    def get(self, request):
+        """GET /wallets/withdraw/ — list user's withdrawal history."""
+        wallet = getattr(request.user, 'wallet', None)
+        if not wallet:
+            return Response({'detail': 'Wallet not found.'}, status=404)
+
+        withdrawals = wallet.withdrawals.all()[:20]
+        serializer = WithdrawalDetailSerializer(withdrawals, many=True)
+        return Response({'withdrawals': serializer.data})

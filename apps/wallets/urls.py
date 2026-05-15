@@ -4,7 +4,9 @@ from apps.wallets.views import (
     BankAccountDetailView,
     BankAccountVerifyView,
     BankAccountSaveView,
-    NigerianBankListView
+    NigerianBankListView,
+    WithdrawalRequestView,
+
 )
 
 
@@ -17,4 +19,5 @@ urlpatterns = [
     path('bank-account/verify/',  BankAccountVerifyView.as_view(), name='bank-account-verify'),
     path('bank-account/save/',    BankAccountSaveView.as_view(),   name='bank-account-save'),
 
+    path('withdraw/', WithdrawalRequestView.as_view(), name='wallet-withdraw'),
 ]

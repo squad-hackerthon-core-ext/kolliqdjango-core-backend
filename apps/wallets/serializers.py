@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Wallet
+from .models import Wallet , WithdrawalRequest
 from services.nigerian_banks import NIGERIAN_BANKS, get_bank_by_code
 
 
@@ -100,3 +100,24 @@ class BankAccountDetailSerializer(serializers.Serializer):
     bank_account_name     = serializers.CharField()
     bank_account_verified = serializers.BooleanField()
     bank_account_updated_at = serializers.DateTimeField()
+
+class WithdrawalRequestSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+    def validate_amount(self, value):
+        if value < Decimal('2500.00'):
+            raise serializers.ValidationError(
+                'Minimum withdrawal amount is ₦2,500.'
+            )
+        return value
+
+
+class WithdrawalDetailSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = WithdrawalRequest
+        fields = [
+            'id', 'amount', 'bank_account_number', 'bank_code',
+            'bank_name', 'bank_account_name', 'status',
+            'rejection_reason', 'created_at', 'updated_at',
+        ]
+        read_only_fields = fields

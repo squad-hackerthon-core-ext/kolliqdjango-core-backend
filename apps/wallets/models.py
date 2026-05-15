@@ -25,6 +25,14 @@ class Wallet(UserOwnedModel):
     escrow_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
     savings_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
 
+    # Bank account details
+    bank_account_number = models.CharField(max_length=10, blank=True)
+    bank_code = models.CharField(max_length=10, blank=True)
+    bank_name = models.CharField(max_length=100, blank=True)
+    bank_account_name = models.CharField(max_length=150, blank=True)
+    bank_account_verified = models.BooleanField(default=False)
+    bank_account_updated_at = models.DateTimeField(blank=True, null=True)
+
     # Status
     is_active = models.BooleanField(default=True)
     squad_creation_status = models.CharField(
@@ -53,3 +61,46 @@ class Wallet(UserOwnedModel):
         self.balance -= Decimal(str(amount))
         if save:
             self.save(update_fields=['balance', 'updated_at'])
+
+class WithdrawalRequest(models.Model):
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        REJECTED = 'rejected', 'Rejected'
+        PROCESSING = 'processing', 'Processing'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    wallet = models.ForeignKey(
+        Wallet, on_delete=models.PROTECT, related_name='withdrawals'
+    )
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+
+    # Snapshot bank details at time of request (in case user changes bank later)
+    bank_account_number = models.CharField(max_length=10)
+    bank_code = models.CharField(max_length=10)
+    bank_name = models.CharField(max_length=100)
+    bank_account_name = models.CharField(max_length=150)
+
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.PENDING
+    )
+    squad_reference = models.CharField(max_length=200, blank=True)
+    rejection_reason = models.TextField(blank=True)
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='reviewed_withdrawals'
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'withdrawal_requests'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Withdrawal ₦{self.amount} — {self.wallet.user.phone} [{self.status}]"
