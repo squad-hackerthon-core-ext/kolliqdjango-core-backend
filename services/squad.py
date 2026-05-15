@@ -516,3 +516,61 @@ class SquadService:
                 payload.get('meta', {}).get('freeze_transaction_ref')
             ),
         }
+
+    # ── NIGERIAN BANKS LIST ───────────────────────────────────────────
+
+NIGERIAN_BANKS = [
+    {"name": "Access Bank", "code": "044"},
+    {"name": "Citibank Nigeria", "code": "023"},
+    {"name": "Ecobank Nigeria", "code": "050"},
+    {"name": "Fidelity Bank", "code": "070"},
+    {"name": "First Bank of Nigeria", "code": "011"},
+    {"name": "First City Monument Bank", "code": "214"},
+    {"name": "Globus Bank", "code": "00103"},
+    {"name": "Guaranty Trust Bank", "code": "058"},
+    {"name": "Heritage Bank", "code": "030"},
+    {"name": "Keystone Bank", "code": "082"},
+    {"name": "Kuda Bank", "code": "50211"},
+    {"name": "Moniepoint MFB", "code": "50515"},
+    {"name": "OPay", "code": "100004"},
+    {"name": "Palmpay", "code": "100033"},
+    {"name": "Polaris Bank", "code": "076"},
+    {"name": "Providus Bank", "code": "101"},
+    {"name": "Stanbic IBTC Bank", "code": "221"},
+    {"name": "Standard Chartered Bank", "code": "068"},
+    {"name": "Sterling Bank", "code": "232"},
+    {"name": "Titan Trust Bank", "code": "102"},
+    {"name": "Union Bank of Nigeria", "code": "032"},
+    {"name": "United Bank for Africa", "code": "033"},
+    {"name": "Unity Bank", "code": "215"},
+    {"name": "VFD Microfinance Bank", "code": "566"},
+    {"name": "Wema Bank", "code": "035"},
+    {"name": "Zenith Bank", "code": "057"},
+]
+
+_BANK_CODE_MAP = {b["code"]: b["name"] for b in NIGERIAN_BANKS}
+
+
+def get_bank_name(bank_code: str) -> str:
+    """Return a bank's display name given its code, or the code itself as fallback."""
+    return _BANK_CODE_MAP.get(bank_code, bank_code)
+
+
+def verify_bank_account(bank_code: str, account_number: str) -> dict:
+    """
+    Verify a bank account via Squad's account lookup API.
+    Returns: { 'account_name': str, 'account_number': str }
+    Raises ValueError on Squad error, Exception on network failure.
+    """
+    squad = SquadService()
+    try:
+        result = squad.account_lookup(bank_code, account_number)
+        account_name = result.get('account_name', '')
+        if not account_name:
+            raise ValueError("Could not retrieve account name. Check account details.")
+        return {
+            'account_name': account_name,
+            'account_number': account_number,
+        }
+    except SquadAPIError as e:
+        raise ValueError(str(e))
