@@ -1,8 +1,9 @@
 from django.contrib import admin
-from unfold.admin import ModelAdmin
-from .models import Wallet , WithdrawalRequest
-from services.squad import SquadService, SquadAPIError
 from django.utils import timezone
+import logging
+from .models import Wallet, WithdrawalRequest
+
+logger = logging.getLogger(__name__)
 
 
 @admin.register(Wallet)
@@ -19,7 +20,6 @@ class WalletAdmin(admin.ModelAdmin):
         return obj.user.phone
     get_user_phone.short_description = 'User Phone'
 
-    
 
 @admin.register(WithdrawalRequest)
 class WithdrawalRequestAdmin(admin.ModelAdmin):
@@ -40,50 +40,33 @@ class WithdrawalRequestAdmin(admin.ModelAdmin):
         return obj.wallet.user.phone
     get_user_phone.short_description = 'User Phone'
 
-    @admin.action(description='✅ Approve & pay out selected withdrawals')
+    @admin.action(description='✅ Approve selected withdrawals (simulated)')
     def approve_withdrawals(self, request, queryset):
         pending = queryset.filter(status=WithdrawalRequest.Status.PENDING)
         if not pending.exists():
             self.message_user(request, 'No pending withdrawals selected.', level='warning')
             return
 
-        squad = SquadService()
         success_count = 0
-        fail_count = 0
 
         for withdrawal in pending:
-            try:
-                withdrawal.status = WithdrawalRequest.Status.PROCESSING
-                withdrawal.reviewed_by = request.user
-                withdrawal.reviewed_at = timezone.now()
-                withdrawal.save(update_fields=['status', 'reviewed_by', 'reviewed_at', 'updated_at'])
-
-                result = squad.initiate_transfer(
-                    amount_naira=withdrawal.amount,
-                    bank_code=withdrawal.bank_code,
-                    account_number=withdrawal.bank_account_number,
-                    account_name=withdrawal.bank_account_name,
-                    reference_suffix=str(withdrawal.id).replace('-', '')[:20],
-                    narration=f'Kolliq withdrawal {str(withdrawal.id)[:8]}',
-                )
-
-                withdrawal.status = WithdrawalRequest.Status.COMPLETED
-                withdrawal.squad_reference = result.get('full_reference', '')
-                withdrawal.save(update_fields=['status', 'squad_reference', 'updated_at'])
-                success_count += 1
-
-            except SquadAPIError as e:
-                # Refund wallet — transfer failed
-                withdrawal.wallet.credit(withdrawal.amount)
-                withdrawal.status = WithdrawalRequest.Status.FAILED
-                withdrawal.rejection_reason = str(e)
-                withdrawal.save(update_fields=['status', 'rejection_reason', 'updated_at'])
-                fail_count += 1
+            withdrawal.status = WithdrawalRequest.Status.PROCESSING
+            withdrawal.reviewed_by = request.user
+            withdrawal.reviewed_at = timezone.now()
+            withdrawal.squad_reference = f"SIM-{str(withdrawal.id).replace('-', '')[:16].upper()}"
+            withdrawal.save(update_fields=[
+                'status', 'reviewed_by', 'reviewed_at', 'squad_reference', 'updated_at'
+            ])
+            success_count += 1
+            logger.info(
+                f"Withdrawal {withdrawal.id} approved (simulated) — "
+                f"amount=₦{withdrawal.amount} user={withdrawal.wallet.user.phone}"
+            )
 
         self.message_user(
             request,
-            f'{success_count} withdrawal(s) paid out successfully. {fail_count} failed (wallet refunded).',
-            level='success' if fail_count == 0 else 'warning',
+            f'{success_count} withdrawal(s) approved and processing.',
+            level='success',
         )
 
     @admin.action(description='❌ Reject selected withdrawals (refund wallet)')
@@ -94,7 +77,6 @@ class WithdrawalRequestAdmin(admin.ModelAdmin):
             return
 
         for withdrawal in pending:
-            # Refund the wallet
             withdrawal.wallet.credit(withdrawal.amount)
             withdrawal.status = WithdrawalRequest.Status.REJECTED
             withdrawal.rejection_reason = f'Rejected by {request.user.phone}'
