@@ -13,6 +13,7 @@ from .serializers import (
 )
 from .matching import match_jobs_for_worker
 import logging
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -341,4 +342,162 @@ class UserRatingsView(APIView):
             'average_rating': round(avg, 2) if avg else None,
             'total_ratings': ratings.count(),
             'ratings': RatingListSerializer(ratings, many=True).data,
+        })
+
+class JobEscrowInstructionsView(APIView):
+    """
+    GET /api/jobs/<job_id>/escrow/
+    Returns payment instructions for a job's escrow deposit.
+    Employer can view this anytime before the job goes live.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, job_id):
+        job = get_object_or_404(Job, id=job_id, employer=request.user)
+
+        if job.escrow_funded:
+            return success_response({
+                'escrow_funded': True,
+                'message': 'Escrow already funded. Job is live.',
+                'job_status': job.status,
+            })
+
+        from apps.payments.escrow import get_escrow_payment_instructions
+        instructions = get_escrow_payment_instructions(job)
+
+        return success_response({
+            'escrow_funded': False,
+            'job_id': str(job.id),
+            'job_title': job.title,
+            **instructions,
+        })
+
+class JobApplicantsView(APIView):
+    """
+    GET /api/jobs/<job_id>/applicants/
+    Employer sees all workers who accepted their job.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, job_id):
+        user = request.user
+        if user.role != 'employer':
+            return error_response('Only employers can view applicants.', status=403)
+
+        job = get_object_or_404(Job, id=job_id, employer=user)
+
+        applications = job.applications.select_related('worker').filter(
+            status__in=[
+                JobApplication.Status.ACCEPTED,
+                JobApplication.Status.COMPLETED,
+            ]
+        ).order_by('-accepted_at')
+
+        data = []
+        for app in applications:
+            worker = app.worker
+            data.append({
+                'application_id': str(app.id),
+                'status': app.status,
+                'accepted_at': app.accepted_at,
+                'completed_at': app.completed_at,
+                'worker': {
+                    'id': str(worker.id),
+                    'name': worker.full_name or worker.phone,
+                    'phone': worker.phone,
+                    'skills': worker.skills,
+                    'location': worker.location_area,
+                    'has_vehicle': worker.has_vehicle,
+                    'vehicle_type': worker.vehicle_type,
+                }
+            })
+
+        return success_response({
+            'job_id': str(job.id),
+            'job_title': job.title,
+            'workers_needed': job.workers_needed,
+            'accepted_count': len(data),
+            'applicants': data,
+        })
+
+class JobFundEscrowView(APIView):
+    """
+    POST /api/jobs/<job_id>/fund-escrow/
+    Employer funds escrow directly from their Kolliq wallet balance.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, job_id):
+        user = request.user
+        if user.role != 'employer':
+            return error_response('Only employers can fund escrow.', status=403)
+
+        job = get_object_or_404(Job, id=job_id, employer=user)
+
+        if job.escrow_funded:
+            return error_response('Escrow already funded. Job is live.', status=409)
+
+        wallet = getattr(user, 'wallet', None)
+        if not wallet:
+            return error_response('Wallet not found.', status=404)
+
+        total_amount = (job.pay_per_worker * job.workers_needed).quantize(Decimal('0.01'))
+
+        if wallet.balance < total_amount:
+            return error_response(
+                f'Insufficient wallet balance. '
+                f'Need ₦{total_amount:,.2f}, have ₦{wallet.balance:,.2f}. '
+                f'Please top up your wallet first.',
+                status=400,
+            )
+
+        try:
+            with db_transaction.atomic():
+                # Debit employer wallet
+                wallet.debit(total_amount)
+
+                # Credit escrow balance
+                wallet.escrow_balance += total_amount
+                wallet.save(update_fields=['escrow_balance', 'updated_at'])
+
+                # Mark job as funded
+                job.escrow_funded = True
+                if not job.escrow_reference:
+                    job.escrow_reference = str(job.id).replace('-', '')[:12].upper()
+                job.save(update_fields=['escrow_funded', 'escrow_reference', 'updated_at'])
+
+                # Record transaction
+                from apps.payments.models import Transaction
+                Transaction.objects.create(
+                    user=user,
+                    transaction_type=Transaction.Type.ESCROW_HOLD,
+                    amount=total_amount,
+                    status=Transaction.Status.SUCCESS,
+                    job=job,
+                    description=f'Escrow funded from wallet for: {job.title}',
+                    metadata={
+                        'job_id': str(job.id),
+                        'pay_per_worker': str(job.pay_per_worker),
+                        'workers_needed': job.workers_needed,
+                        'funded_from': 'wallet',
+                    }
+                )
+
+        except ValueError as e:
+            return error_response(str(e), status=400)
+        except Exception as e:
+            logger.error(f"Fund escrow failed: job={job_id} user={user.id} error={e}")
+            return error_response('Failed to fund escrow. Please try again.', status=500)
+
+        # Trigger worker matching notifications now job is live
+        from apps.jobs.tasks import trigger_job_matching_notifications
+        trigger_job_matching_notifications.delay(str(job.id))
+
+        return success_response({
+            'job_id': str(job.id),
+            'job_title': job.title,
+            'escrow_funded': True,
+            'amount_held': str(total_amount),
+            'wallet_balance': str(wallet.balance),
+            'message': f'₦{total_amount:,.2f} held in escrow. Job is now live and workers are being notified.',
         })
